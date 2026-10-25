@@ -1,0 +1,165 @@
+-- SettingsController (LocalScript, StarterPlayerScripts)  -- key: K, or the gear button (top-right)
+-- Loads saved settings from the server, applies them, and publishes them as LocalPlayer attributes
+-- ("Setting_<Name>") so ANY client script can read them, e.g.:
+--     if Players.LocalPlayer:GetAttribute("Setting_CameraShake") ~= false then shake() end
+-- DomainController, EffectsController and UIKit in this batch already respect these.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Remotes = require(ReplicatedStorage:WaitForChild("Remotes"))
+local UIKit = require(ReplicatedStorage:WaitForChild("UIKit"))
+local T = UIKit.Theme
+local LP = Players.LocalPlayer
+
+local TOGGLE_KEY = Enum.KeyCode.K -- ASSUMPTION: not used by CombatController
+
+local settings = { MasterVolume = 0.8, MusicVolume = 0.5, CameraShake = true, ShowTracker = true, UIScale = 1, DamageNumbers = true, Keybinds = {} }
+
+local function apply()
+	for k, v in settings do
+		if type(v) ~= "table" then LP:SetAttribute("Setting_" .. k, v) end
+	end
+	-- Keybinds -> Setting_Key_<Action> (read by Keybinds.Get)
+	for action, key in settings.Keybinds or {} do LP:SetAttribute("Setting_Key_" .. action, key) end
+	-- Mission tracker visibility is handled by MissionController reading Setting_ShowTracker.
+end
+
+local saveQueued = false
+local function save()
+	apply()
+	if saveQueued then return end
+	saveQueued = true
+	task.delay(1.5, function() -- debounce slider spam
+		saveQueued = false
+		Remotes.Event("SettingsSave"):FireServer(settings)
+	end)
+end
+
+local gui = UIKit.Screen("SettingsUI", 45)
+local panel, body = UIKit.Panel(gui, "Settings", UDim2.fromOffset(380, 560))
+panel.Visible = false
+-- make body scrollable to fit the keybind list
+body = (function()
+	local s = UIKit.Scroll(body, UDim2.fromScale(1, 1))
+	s.BackgroundTransparency = 1
+	s:FindFirstChildOfClass("UIListLayout"):Destroy() -- we position manually
+	return s
+end)()
+
+local gear = UIKit.Button(gui, "⚙", UDim2.fromOffset(36, 36), UDim2.new(1, -52, 0, 16))
+gear.TextSize = 20
+gear.MouseButton1Click:Connect(function() panel.Visible = not panel.Visible end)
+
+local y = 0
+local refreshers = {}
+
+local function slider(label, key, min, max)
+	UIKit.Label(body, label, UDim2.new(0.45, 0, 0, 28), UDim2.fromOffset(0, y))
+	local track = Instance.new("TextButton")
+	track.Text = ""; track.AutoButtonColor = false
+	track.Size = UDim2.new(0.45, 0, 0, 8); track.Position = UDim2.new(0.45, 0, 0, y + 10)
+	track.BackgroundColor3 = T.Bg; track.BorderSizePixel = 0; track.Parent = body
+	local fill = Instance.new("Frame"); fill.BackgroundColor3 = T.Accent; fill.BorderSizePixel = 0; fill.Parent = track
+	local val = UIKit.Label(body, "", UDim2.new(0.1, 0, 0, 28), UDim2.new(0.9, 0, 0, y), { TextXAlignment = Enum.TextXAlignment.Right, TextColor3 = T.SubText })
+	local function refresh()
+		local a = (settings[key] - min) / (max - min)
+		fill.Size = UDim2.fromScale(a, 1)
+		val.Text = tostring(math.floor(settings[key] * 100 + 0.5)) .. "%"
+	end
+	local dragging = false
+	local function setFromX(x)
+		local a = math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+		settings[key] = math.floor((min + a * (max - min)) * 100 + 0.5) / 100
+		refresh(); save()
+	end
+	track.MouseButton1Down:Connect(function(x) dragging = true; setFromX(x) end)
+	game:GetService("UserInputService").InputChanged:Connect(function(i)
+		if dragging and i.UserInputType == Enum.UserInputType.MouseMovement then setFromX(i.Position.X) end
+	end)
+	game:GetService("UserInputService").InputEnded:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+	end)
+	table.insert(refreshers, refresh)
+	y += 36
+end
+
+local function toggle(label, key)
+	UIKit.Label(body, label, UDim2.new(0.6, 0, 0, 28), UDim2.fromOffset(0, y))
+	local b = UIKit.Button(body, "", UDim2.new(0.3, 0, 0, 26), UDim2.new(0.7, 0, 0, y + 1))
+	local function refresh()
+		b.Text = settings[key] and "ON" or "OFF"
+		b.BackgroundColor3 = settings[key] and T.Good or T.AccentDim
+	end
+	b.MouseButton1Click:Connect(function() settings[key] = not settings[key]; refresh(); save() end)
+	table.insert(refreshers, refresh)
+	y += 36
+end
+
+slider("Master Volume", "MasterVolume", 0, 1)
+slider("Music Volume", "MusicVolume", 0, 1)
+slider("UI Scale", "UIScale", 0.75, 1.5)
+toggle("Camera Shake", "CameraShake")
+toggle("Mission Tracker", "ShowTracker")
+toggle("Damage Numbers", "DamageNumbers")
+-- Keybind remapping -------------------------------------------------------------
+local Keybinds = require(ReplicatedStorage:WaitForChild("Keybinds"))
+local UIS = game:GetService("UserInputService")
+
+UIKit.Label(body, "KEYBINDS  (click, then press a key)", UDim2.new(1, 0, 0, 20), UDim2.fromOffset(0, y + 6),
+	{ TextColor3 = T.Accent, TextSize = 12, Font = T.FontBold })
+y += 30
+for _, action in Keybinds.Order do
+	local isCombat = Keybinds.Defaults[action] and not ({ Inventory = 1, Missions = 1, Lineage = 1, Trade = 1, Party = 1, Settings = 1 })[action]
+	UIKit.Label(body, action .. (isCombat and "  *" or ""), UDim2.new(0.6, 0, 0, 26), UDim2.fromOffset(0, y))
+	local b = UIKit.Button(body, "", UDim2.new(0.3, 0, 0, 24), UDim2.new(0.68, 0, 0, y + 1))
+	local function refresh() local kc = Keybinds.Get(action); b.Text = kc and kc.Name or "-" end
+	b.MouseButton1Click:Connect(function()
+		if UIKit.Capturing then return end
+		UIKit.Capturing = true
+		b.Text = "..."
+		local conn
+		conn = UIS.InputBegan:Connect(function(input)
+			if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+			conn:Disconnect()
+			task.defer(function() UIKit.Capturing = false end) -- defer so this keypress doesn't also toggle a panel
+			local kc = input.KeyCode
+			if kc == Enum.KeyCode.Escape then refresh() return end
+			if Keybinds.Reserved[kc] then UIKit.Toast(kc.Name .. " can't be bound.", T.Bad); refresh() return end
+			local other = Keybinds.ActionUsing(kc)
+			if other and other ~= action then
+				-- swap: give the other action this action's old key
+				local old = Keybinds.Get(action)
+				settings.Keybinds[other] = old and old.Name or nil
+				UIKit.Toast(("Swapped with %s"):format(other), T.SubText)
+			end
+			settings.Keybinds[action] = kc.Name
+			save()
+			for _, r in refreshers do r() end
+		end)
+	end)
+	table.insert(refreshers, refresh)
+	y += 30
+end
+UIKit.Label(body, "* combat keys only take effect once CombatController uses Keybinds.Is().",
+	UDim2.new(1, 0, 0, 30), UDim2.fromOffset(0, y + 4), { TextColor3 = T.SubText, TextSize = 11 })
+local reset = UIKit.Button(body, "Reset keybinds", UDim2.new(1, 0, 0, 26), UDim2.fromOffset(0, y + 38))
+reset.MouseButton1Click:Connect(function()
+	for action in settings.Keybinds do LP:SetAttribute("Setting_Key_" .. action, nil) end
+	settings.Keybinds = {}
+	save()
+	for _, r in refreshers do r() end
+end)
+body.CanvasSize = UDim2.fromOffset(0, y + 80)
+body.AutomaticCanvasSize = Enum.AutomaticSize.None
+
+UIKit.BindToggle(TOGGLE_KEY, panel)
+
+task.spawn(function()
+	local ok, saved = pcall(function() return Remotes.Function("GetSettings"):InvokeServer() end)
+	if ok and type(saved) == "table" then
+		for k, v in saved do settings[k] = v end
+		if type(settings.Keybinds) ~= "table" then settings.Keybinds = {} end
+	end
+	for _, r in refreshers do r() end
+	apply()
+end)
