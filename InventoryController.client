@@ -1,0 +1,86 @@
+-- InventoryController (LocalScript, StarterPlayerScripts)  -- key: I
+-- Server-authoritative: the client only SENDS requests (Equip/Use/Drop); the server validates and re-syncs.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Remotes = require(ReplicatedStorage:WaitForChild("Remotes"))
+local UIKit = require(ReplicatedStorage:WaitForChild("UIKit"))
+local T = UIKit.Theme
+
+local TOGGLE_KEY = Enum.KeyCode.I -- ASSUMPTION: not used by CombatController
+
+local gui = UIKit.Screen("InventoryUI", 20)
+local panel, body = UIKit.Panel(gui, "Inventory", UDim2.fromOffset(560, 400))
+panel.Visible = false
+
+local list = UIKit.Scroll(body, UDim2.new(0.55, -4, 1, 0))
+local detail = Instance.new("Frame")
+detail.Size = UDim2.new(0.45, -4, 1, 0)
+detail.Position = UDim2.new(0.55, 4, 0, 0)
+detail.BackgroundColor3 = T.Bg
+detail.BorderSizePixel = 0
+detail.Parent = body
+Instance.new("UICorner", detail).CornerRadius = UDim.new(0, 6)
+
+local dName = UIKit.Label(detail, "Select an item", UDim2.new(1, -16, 0, 26), UDim2.fromOffset(8, 8), { Font = T.FontBold, TextSize = 18 })
+local dMeta = UIKit.Label(detail, "", UDim2.new(1, -16, 0, 18), UDim2.fromOffset(8, 36), { TextColor3 = T.SubText, TextSize = 13 })
+local dDesc = UIKit.Label(detail, "", UDim2.new(1, -16, 1, -150), UDim2.fromOffset(8, 60), { TextYAlignment = Enum.TextYAlignment.Top })
+local equipBtn = UIKit.Button(detail, "Equip", UDim2.new(1, -16, 0, 28), UDim2.new(0, 8, 1, -104))
+local useBtn = UIKit.Button(detail, "Use", UDim2.new(1, -16, 0, 28), UDim2.new(0, 8, 1, -70))
+local dropBtn = UIKit.Button(detail, "Drop", UDim2.new(1, -16, 0, 28), UDim2.new(0, 8, 1, -36))
+dropBtn.BackgroundColor3 = T.Bad
+
+local items = {}
+local selectedUid = nil
+
+local USABLE = { Consumable = true, Potion = true, Scroll = true }
+
+local function showDetail(item)
+	selectedUid = item and item.Uid
+	equipBtn.Visible, useBtn.Visible, dropBtn.Visible = item ~= nil, item ~= nil, item ~= nil
+	if not item then dName.Text = "Select an item"; dMeta.Text = ""; dDesc.Text = "" return end
+	dName.Text = item.Name
+	dName.TextColor3 = UIKit.RarityColors[item.Rarity] or T.Text
+	dMeta.Text = ("%s  •  %s  •  x%d"):format(item.Rarity, item.Type, item.Quantity)
+	dDesc.Text = item.Description
+	equipBtn.Text = item.Equipped and "Unequip" or "Equip"
+	useBtn.Visible = USABLE[item.Type] == true
+end
+
+local function render()
+	UIKit.Clear(list)
+	local stillSelected = nil
+	for i, item in items do
+		local row = UIKit.Button(list, "", UDim2.new(1, 0, 0, 32))
+		row.LayoutOrder = i
+		row.BackgroundColor3 = item.Uid == selectedUid and T.AccentDim or T.Panel
+		UIKit.Label(row, (item.Equipped and "[E] " or "") .. item.Name, UDim2.new(1, -60, 1, 0), UDim2.fromOffset(8, 0),
+			{ TextColor3 = UIKit.RarityColors[item.Rarity] or T.Text })
+		UIKit.Label(row, "x" .. item.Quantity, UDim2.new(0, 50, 1, 0), UDim2.new(1, -56, 0, 0),
+			{ TextXAlignment = Enum.TextXAlignment.Right, TextColor3 = T.SubText })
+		row.MouseButton1Click:Connect(function() showDetail(item); render() end)
+		if item.Uid == selectedUid then stillSelected = item end
+	end
+	showDetail(stillSelected)
+end
+
+local function send(action)
+	if selectedUid ~= nil then Remotes.Event("InventoryAction"):FireServer(action, selectedUid) end
+end
+equipBtn.MouseButton1Click:Connect(function()
+	local it; for _, x in items do if x.Uid == selectedUid then it = x end end
+	send(it and it.Equipped and "Unequip" or "Equip")
+end)
+useBtn.MouseButton1Click:Connect(function() send("Use") end)
+dropBtn.MouseButton1Click:Connect(function() send("Drop") end)
+
+Remotes.Event("InventorySync").OnClientEvent:Connect(function(newItems)
+	items = newItems or {}
+	render()
+end)
+
+UIKit.BindToggle(TOGGLE_KEY, panel, function()
+	local snap = Remotes.Function("RequestSnapshot"):InvokeServer("Inventory")
+	if snap then items = snap; render() end
+end)
+
+showDetail(nil)
