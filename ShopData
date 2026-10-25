@@ -1,0 +1,34 @@
+-- ShopData (ModuleScript, ReplicatedStorage)
+-- Vendor stock. ItemIds are PLACEHOLDERS - they MUST match keys in your ItemData or purchases will fail
+-- (ShopService warns in Output for any id it can't find in ItemData).
+--
+-- Stock entry: { ItemId, Price, Limit? }  Limit = max per purchase (default 10)
+-- SellRate: fraction of item value paid when selling (value = ItemData .Price/.Value/.SellPrice, else 10)
+
+local ShopData = {}
+
+ShopData.Currency = "Yen" -- ASSUMPTION: display name for currency. Change to whatever ProgressionService/PlayerDataService uses.
+
+ShopData.Shops = {
+	Fence = {
+		Name = "Rook's Wares",
+		SellRate = 0.4,
+		CanSell = true,
+		Stock = {
+			{ ItemId = "RustyBlade", Price = 150 },
+			{ ItemId = "TalismanMinor", Price = 400 },
+			{ ItemId = "CursedFinger", Price = 2500, Limit = 1 },
+		},
+	},
+	Apothecary = {
+		Name = "Field Supplies",
+		SellRate = 0.25,
+		CanSell = false,
+		Stock = {
+			{ ItemId = "Bandage", Price = 25 },
+			{ ItemId = "HexTonic", Price = 80 },
+		},
+	},
+}
+
+return ShopData
