@@ -1,0 +1,126 @@
+--!nonstrict
+--[[
+	MissionData  (ReplicatedStorage/Shared/MissionData)
+	HEXBOUND - mission types, curse definitions, maps and rewards.
+
+	Mission types (original equivalents of the genre's standard mission set):
+	  Exorcism  : kill a set number of curses in the zone
+	  PurgeNest : destroy every Curse Nest (a stationary object that spawns curses) while they keep spawning
+	  Escort    : bring a civilian to the extraction point; fail if they die
+	  Warding   : protect a Ward Stone through several waves
+	  Calamity  : a boss fight against a named curse, with phases
+]]
+
+local MissionData = {}
+
+----------------------------------------------------------------------
+-- Curses (enemy NPCs)
+----------------------------------------------------------------------
+MissionData.Curses = {
+	Gnawer = {
+		name = "Gnawer", grade = "Grade4", health = 60, walkSpeed = 14, damageMult = 0.7,
+		aggroRange = 60, attackRange = 6, blockChance = 0.05, techniques = {},
+		scale = 0.9, color = Color3.fromRGB(70, 60, 80), xp = 15, marks = 3,
+	},
+	Weeper = {
+		name = "Weeper", grade = "Grade3", health = 90, walkSpeed = 13, damageMult = 0.8,
+		aggroRange = 70, attackRange = 6, blockChance = 0.1, techniques = { "CurseSpit" },
+		scale = 1.0, color = Color3.fromRGB(60, 80, 90), xp = 25, marks = 5,
+	},
+	Husk = {
+		name = "Husk", grade = "Grade2", health = 160, walkSpeed = 12, damageMult = 1.0,
+		aggroRange = 70, attackRange = 7, blockChance = 0.25, techniques = { "CurseSlam" },
+		scale = 1.25, color = Color3.fromRGB(90, 50, 50), xp = 45, marks = 9,
+	},
+	Lurker = {
+		name = "Lurker", grade = "Grade1", health = 240, walkSpeed = 17, damageMult = 1.15,
+		aggroRange = 90, attackRange = 6, blockChance = 0.3, techniques = { "CurseSpit", "CurseSlam" },
+		scale = 1.1, color = Color3.fromRGB(30, 30, 40), xp = 80, marks = 15,
+	},
+	-- Bosses
+	TheMourningBell = {
+		name = "The Mourning Bell", grade = "Special", health = 2200, walkSpeed = 15, damageMult = 1.4,
+		aggroRange = 150, attackRange = 9, blockChance = 0.35, techniques = { "CurseSlam", "CurseSpit" },
+		scale = 2.0, color = Color3.fromRGB(110, 90, 40), xp = 900, marks = 200, boss = true,
+		phases = { { atHealth = 0.6, damageMult = 1.6, walkSpeed = 18 }, { atHealth = 0.25, damageMult = 1.9, walkSpeed = 21 } },
+	},
+	Nest = { -- not a walking curse; MissionService builds it as a structure
+		name = "Curse Nest", health = 400, structure = true, xp = 60, marks = 12,
+	},
+}
+
+----------------------------------------------------------------------
+-- Drop tables: rolled once per player when a mission is completed
+----------------------------------------------------------------------
+MissionData.DropTables = {
+	Low = {
+		{ item = "CurseResidue", weight = 60, min = 2, max = 5 },
+		{ item = "HexDraught",   weight = 20, min = 1, max = 1 },
+		{ item = "MendingSalt",  weight = 15, min = 1, max = 1 },
+		{ item = "SpinToken",    weight = 5,  min = 1, max = 1 },
+	},
+	Mid = {
+		{ item = "CurseResidue", weight = 40, min = 4, max = 8 },
+		{ item = "WardInk",      weight = 25, min = 1, max = 3 },
+		{ item = "SpinToken",    weight = 15, min = 1, max = 1 },
+		{ item = "CharmOfWard",  weight = 10, min = 1, max = 1 },
+		{ item = "KnucklebonesRing", weight = 8, min = 1, max = 1 },
+		{ item = "ResetSigil",   weight = 2,  min = 1, max = 1 },
+	},
+	High = {
+		{ item = "WardInk",      weight = 35, min = 2, max = 5 },
+		{ item = "NestHeart",    weight = 25, min = 1, max = 2 },
+		{ item = "SpinToken",    weight = 20, min = 1, max = 2 },
+		{ item = "InkwellPendant", weight = 12, min = 1, max = 1 },
+		{ item = "CrownShard",   weight = 3,  min = 1, max = 1 },
+		{ item = "ResetSigil",   weight = 5,  min = 1, max = 1 },
+	},
+	Boss = {
+		{ item = "BoundSeal",    weight = 40, min = 1, max = 1 },
+		{ item = "SpinToken",    weight = 30, min = 2, max = 3 },
+		{ item = "CrownShard",   weight = 15, min = 1, max = 1 },
+		{ item = "InkwellPendant", weight = 15, min = 1, max = 1 },
+	},
+}
+
+----------------------------------------------------------------------
+-- Missions (the board offers these). map = a MapBuilder theme id.
+----------------------------------------------------------------------
+MissionData.Missions = {
+	SubwayExorcism = {
+		name = "Last Train Exorcism", type = "Exorcism", map = "DerelictSubway", minLevel = 1,
+		timeLimit = 300, killTarget = 10, roster = { Gnawer = 6, Weeper = 4 }, maxAlive = 5,
+		rewards = { xp = 150, marks = 40, drops = "Low", rolls = 1 },
+	},
+	SchoolNest = {
+		name = "Rot Under the Schoolhouse", type = "PurgeNest", map = "AbandonedSchool", minLevel = 10,
+		timeLimit = 420, nests = 3, nestSpawn = { Gnawer = 2, Weeper = 1 }, nestInterval = 12, maxAlive = 8,
+		rewards = { xp = 350, marks = 90, drops = "Mid", rolls = 1 },
+	},
+	MarketEscort = {
+		name = "Lanterns Out at the Night Market", type = "Escort", map = "NightMarket", minLevel = 15,
+		timeLimit = 360, civilianHealth = 150, ambushRoster = { Weeper = 4, Husk = 2 }, ambushes = 3,
+		rewards = { xp = 450, marks = 110, drops = "Mid", rolls = 2 },
+	},
+	ShrineWarding = {
+		name = "Hold the Drowned Shrine", type = "Warding", map = "FloodedShrine", minLevel = 25,
+		timeLimit = 480, wardHealth = 600,
+		waves = {
+			{ Gnawer = 6, Weeper = 2 },
+			{ Weeper = 4, Husk = 2 },
+			{ Husk = 3, Lurker = 2 },
+		},
+		waveDelay = 8,
+		rewards = { xp = 800, marks = 180, drops = "High", rolls = 2 },
+	},
+	BellCalamity = {
+		name = "The Bell Tolls Twice", type = "Calamity", map = "RooftopCathedral", minLevel = 40,
+		timeLimit = 600, boss = "TheMourningBell", adds = { Husk = 2 }, addsAtPhase = true,
+		rewards = { xp = 2500, marks = 600, drops = "Boss", rolls = 3 },
+	},
+}
+
+MissionData.MaxPartySize = 4
+MissionData.Instancing = { spacing = 2000, baseY = 500 } -- each mission map is built in its own far-away area
+
+return MissionData
