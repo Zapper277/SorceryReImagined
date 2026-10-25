@@ -1,1 +1,483 @@
 
+--!nonstrict
+--[[
+	MapBuilder  (ServerScriptService/Services/MapBuilder)
+	HEXBOUND - builds a playable greybox (blockout) map for each mission theme, plus the hub.
+
+	These are layout blockouts made of Parts: the right scale, paths, cover, sightlines and
+	objective placements. They're meant to be played and tuned now, then replaced or dressed by an
+	environment artist later. Each theme uses a seed so prop placement varies between runs while
+	keeping the same overall layout.
+
+	MapBuilder:Build(themeId, origin: Vector3, seed?) -> layout
+	layout = {
+		folder: Folder,
+		playerSpawns: { CFrame },
+		curseSpawns: { Vector3 },
+		nests: { Vector3 }?,          -- PurgeNest
+		escortPath: { Vector3 }?,     -- Escort (first = start, last = extraction)
+		ward: Vector3?,               -- Warding
+		bossSpawn: Vector3?,          -- Calamity
+		bounds: { center: Vector3, size: Vector3 }, -- MissionService uses this to bring players back if they fall out of the map
+	}
+	MapBuilder:BuildHub(origin) -> { folder, spawn: CFrame, missionBoard: BasePart, rollShrine: BasePart }
+]]
+
+local MapBuilder = {}
+
+----------------------------------------------------------------------
+-- Part helpers
+----------------------------------------------------------------------
+local function part(parent, props)
+	local p = Instance.new("Part")
+	p.Anchored = true
+	p.TopSurface = Enum.SurfaceType.Smooth
+	p.BottomSurface = Enum.SurfaceType.Smooth
+	p.Material = props.Material or Enum.Material.Concrete
+	p.Color = props.Color or Color3.fromRGB(90, 90, 95)
+	p.Size = props.Size
+	p.CFrame = props.CFrame
+	if props.Shape then p.Shape = props.Shape end
+	if props.Transparency then p.Transparency = props.Transparency end
+	if props.CanCollide == false then p.CanCollide = false end
+	p.Name = props.Name or "Block"
+	p.Parent = parent
+	return p
+end
+
+local function light(parentPart, color, range, brightness)
+	local l = Instance.new("PointLight")
+	l.Color = color
+	l.Range = range or 24
+	l.Brightness = brightness or 1.5
+	l.Shadows = false
+	l.Parent = parentPart
+	return l
+end
+
+local function lamp(parent, pos, color)
+	local p = part(parent, { Name = "Lamp", Size = Vector3.new(1.5, 0.6, 1.5), CFrame = CFrame.new(pos),
+		Material = Enum.Material.Neon, Color = color, CanCollide = false })
+	light(p, color, 28, 1.6)
+	return p
+end
+
+-- A box room with walls (no ceiling unless one is requested). doors = list of { side = "N|S|E|W", width }
+local function room(parent, center: Vector3, size: Vector3, opts)
+	opts = opts or {}
+	local wallT = 2
+	local mat = opts.wallMaterial or Enum.Material.Concrete
+	local col = opts.wallColor or Color3.fromRGB(85, 85, 90)
+	if not opts.noFloor then
+		part(parent, { Name = "Floor", Size = Vector3.new(size.X, 1, size.Z), CFrame = CFrame.new(center - Vector3.new(0, 0.5, 0)),
+			Material = opts.floorMaterial or Enum.Material.Slate, Color = opts.floorColor or Color3.fromRGB(60, 60, 65) })
+	end
+
+	local doors = {}
+	for _, d in ipairs(opts.doors or {}) do doors[d.side] = d.width end
+
+	local function wall(side, length, cf)
+		local doorW = doors[side]
+		if not doorW then
+			part(parent, { Name = "Wall", Size = Vector3.new(length, size.Y, wallT), CFrame = cf * CFrame.new(0, size.Y / 2, 0),
+				Material = mat, Color = col })
+			return
+		end
+		local seg = (length - doorW) / 2
+		for _, sign in ipairs({ -1, 1 }) do
+			part(parent, { Name = "Wall", Size = Vector3.new(seg, size.Y, wallT),
+				CFrame = cf * CFrame.new(sign * (doorW / 2 + seg / 2), size.Y / 2, 0), Material = mat, Color = col })
+		end
+		part(parent, { Name = "Lintel", Size = Vector3.new(doorW, size.Y * 0.3, wallT),
+			CFrame = cf * CFrame.new(0, size.Y * 0.85, 0), Material = mat, Color = col })
+	end
+	wall("N", size.X, CFrame.new(center + Vector3.new(0, 0, -size.Z / 2)))
+	wall("S", size.X, CFrame.new(center + Vector3.new(0, 0, size.Z / 2)))
+	wall("E", size.Z, CFrame.new(center + Vector3.new(size.X / 2, 0, 0)) * CFrame.Angles(0, math.rad(90), 0))
+	wall("W", size.Z, CFrame.new(center + Vector3.new(-size.X / 2, 0, 0)) * CFrame.Angles(0, math.rad(90), 0))
+	if opts.ceiling then
+		part(parent, { Name = "Ceiling", Size = Vector3.new(size.X, 1, size.Z), CFrame = CFrame.new(center + Vector3.new(0, size.Y + 0.5, 0)),
+			Material = mat, Color = col })
+	end
+end
+
+-- Scatter cover blocks inside a rectangle, keeping clear of the given points
+local function scatterCover(parent, rng, center, area: Vector2, count, keepClear, style)
+	local placed = 0
+	local tries = 0
+	while placed < count and tries < count * 10 do
+		tries += 1
+		local x = center.X + (rng:NextNumber() - 0.5) * area.X
+		local z = center.Z + (rng:NextNumber() - 0.5) * area.Y
+		local pos = Vector3.new(x, center.Y, z)
+		local ok = true
+		for _, k in ipairs(keepClear or {}) do
+			if (Vector3.new(k.X, center.Y, k.Z) - pos).Magnitude < 14 then ok = false break end
+		end
+		if ok then
+			local s = style or {}
+			local w = rng:NextNumber(s.minW or 4, s.maxW or 10)
+			local h = rng:NextNumber(s.minH or 3, s.maxH or 6)
+			local d = rng:NextNumber(s.minW or 4, s.maxW or 10)
+			part(parent, { Name = s.name or "Cover", Size = Vector3.new(w, h, d),
+				CFrame = CFrame.new(pos + Vector3.new(0, h / 2, 0)) * CFrame.Angles(0, rng:NextNumber(0, math.pi), 0),
+				Material = s.material or Enum.Material.Concrete, Color = s.color or Color3.fromRGB(100, 100, 105) })
+			placed += 1
+		end
+	end
+end
+
+local function killFloor(parent, center, size)
+	-- Invisible part below the map; MissionService teleports anything that touches it back to a spawn
+	return part(parent, { Name = "KillFloor", Size = Vector3.new(size.X + 200, 2, size.Z + 200),
+		CFrame = CFrame.new(center - Vector3.new(0, 60, 0)), Transparency = 1, CanCollide = false })
+end
+
+----------------------------------------------------------------------
+-- Themes
+----------------------------------------------------------------------
+local Themes = {}
+
+--[[ DerelictSubway (Exorcism)
+	A long platform hall with two track trenches, a stalled train you can use as cover,
+	and side service tunnels. The fighting is close-range in the tunnels and mid-range on the platform. ]]
+Themes.DerelictSubway = function(f, o, rng)
+	local L = {}
+	local tile = Color3.fromRGB(150, 145, 130)
+	part(f, { Name = "BaseFloor", Size = Vector3.new(240, 1, 90), CFrame = CFrame.new(o + Vector3.new(0, -5.5, 0)),
+		Material = Enum.Material.Concrete, Color = Color3.fromRGB(50, 48, 45) })
+	room(f, o, Vector3.new(240, 28, 90), { noFloor = true, ceiling = true, floorMaterial = Enum.Material.Marble, floorColor = tile,
+		wallColor = Color3.fromRGB(120, 115, 100), doors = { { side = "E", width = 14 }, { side = "W", width = 14 } } })
+	-- Track trenches: dark strips 4 studs lower, built as floor sections
+	for _, z in ipairs({ -26, 26 }) do
+		part(f, { Name = "TrackBed", Size = Vector3.new(240, 1, 18), CFrame = CFrame.new(o + Vector3.new(0, -4.5, z)),
+			Material = Enum.Material.Pebble, Color = Color3.fromRGB(40, 38, 35) })
+		for _, dz in ipairs({ -4, 4 }) do
+			part(f, { Name = "Rail", Size = Vector3.new(240, 0.6, 0.6), CFrame = CFrame.new(o + Vector3.new(0, -3.7, z + dz)),
+				Material = Enum.Material.Metal, Color = Color3.fromRGB(120, 110, 100) })
+		end
+	end
+	-- Rebuild the platform floor raised above the trenches
+	part(f, { Name = "Platform", Size = Vector3.new(240, 4, 34), CFrame = CFrame.new(o + Vector3.new(0, -2, 0)),
+		Material = Enum.Material.Marble, Color = tile })
+	-- Stalled train in the north trench
+	for i = 0, 3 do
+		local car = part(f, { Name = "TrainCar", Size = Vector3.new(44, 12, 12),
+			CFrame = CFrame.new(o + Vector3.new(-75 + i * 48, 2, -26)), Material = Enum.Material.Metal, Color = Color3.fromRGB(70, 90, 80) })
+		lamp(f, car.Position + Vector3.new(0, 6.5, 0), Color3.fromRGB(255, 80, 60))
+	end
+	-- Pillars down the platform
+	for x = -100, 100, 25 do
+		for _, z in ipairs({ -10, 10 }) do
+			part(f, { Name = "Pillar", Size = Vector3.new(3, 28, 3), CFrame = CFrame.new(o + Vector3.new(x, 14, z)),
+				Color = Color3.fromRGB(130, 125, 110) })
+		end
+		lamp(f, o + Vector3.new(x, 26, 0), Color3.fromRGB(200, 220, 255))
+	end
+	-- Service tunnels on both ends
+	for _, side in ipairs({ -1, 1 }) do
+		room(f, o + Vector3.new(side * 150, 0, 0), Vector3.new(60, 16, 20), { ceiling = true,
+			doors = { { side = side < 0 and "E" or "W", width = 14 } }, wallColor = Color3.fromRGB(70, 70, 70) })
+		lamp(f, o + Vector3.new(side * 160, 14, 0), Color3.fromRGB(255, 170, 60))
+	end
+	scatterCover(f, rng, o, Vector2.new(200, 26), 8, {}, { name = "Bench", minW = 3, maxW = 8, minH = 2, maxH = 3,
+		material = Enum.Material.Wood, color = Color3.fromRGB(90, 60, 40) })
+
+	L.playerSpawns = { CFrame.new(o + Vector3.new(-100, 3, 0)), CFrame.new(o + Vector3.new(-100, 3, 6)),
+		CFrame.new(o + Vector3.new(-100, 3, -6)), CFrame.new(o + Vector3.new(-95, 3, 0)) }
+	L.curseSpawns = { o + Vector3.new(60, 3, 0), o + Vector3.new(100, 3, 0), o + Vector3.new(160, 3, 0),
+		o + Vector3.new(-160, 3, 0), o + Vector3.new(0, 3, 0), o + Vector3.new(30, -2, 26) }
+	L.size = Vector3.new(360, 30, 90)
+	return L
+end
+
+--[[ AbandonedSchool (PurgeNest)
+	Two floors: a ground-floor hallway with classrooms on both sides and a gym at the end.
+	The three nests sit in a classroom, the gym, and the upstairs library, so players have to
+	move through the building instead of holding one spot. ]]
+Themes.AbandonedSchool = function(f, o, rng)
+	local L = {}
+	local wallC = Color3.fromRGB(170, 160, 140)
+	-- Hallway: floor and ceiling only. The classroom walls (with doors) form its sides, and
+	-- the end walls have doors to the gym (E) and the stairwell (W).
+	part(f, { Name = "HallFloor", Size = Vector3.new(170, 1, 22), CFrame = CFrame.new(o + Vector3.new(0, -0.5, 0)),
+		Material = Enum.Material.WoodPlanks, Color = Color3.fromRGB(110, 85, 60) })
+	part(f, { Name = "HallCeiling", Size = Vector3.new(170, 1, 22), CFrame = CFrame.new(o + Vector3.new(0, 14.5, 0)),
+		Material = Enum.Material.Concrete, Color = wallC })
+	for i = -3, 3 do lamp(f, o + Vector3.new(i * 24, 13.5, 0), Color3.fromRGB(230, 235, 210)) end
+	-- Classrooms, built as separate rooms beside the hallway with their doors facing it
+	local classrooms = {}
+	for i = -1, 1 do
+		for _, side in ipairs({ -1, 1 }) do
+			local c = o + Vector3.new(i * 50, 0, side * 26)
+			room(f, c, Vector3.new(44, 14, 30), { ceiling = true, wallColor = wallC,
+				floorMaterial = Enum.Material.WoodPlanks, floorColor = Color3.fromRGB(120, 95, 70),
+				doors = { { side = side < 0 and "S" or "N", width = 8 } } })
+			-- Desks
+			for dx = -12, 12, 8 do
+				for dz = -6, 6, 6 do
+					if rng:NextNumber() > 0.3 then
+						part(f, { Name = "Desk", Size = Vector3.new(4, 3, 3),
+							CFrame = CFrame.new(c + Vector3.new(dx, 1.5, dz)) * CFrame.Angles(0, rng:NextNumber(-0.4, 0.4), 0),
+							Material = Enum.Material.Wood, Color = Color3.fromRGB(140, 105, 70) })
+					end
+				end
+			end
+			lamp(f, c + Vector3.new(0, 13, 0), Color3.fromRGB(220, 230, 200))
+			table.insert(classrooms, c)
+		end
+	end
+	-- Gym at the east end
+	local gym = o + Vector3.new(130, 0, 0)
+	for _, z in ipairs({ -8, 8 }) do
+		part(f, { Name = "Wall", Size = Vector3.new(2, 14, 6), CFrame = CFrame.new(o + Vector3.new(81, 7, z)), Color = wallC })
+	end
+	room(f, gym, Vector3.new(90, 30, 70), { ceiling = true, wallColor = Color3.fromRGB(150, 140, 120),
+		floorMaterial = Enum.Material.WoodPlanks, floorColor = Color3.fromRGB(170, 130, 80),
+		doors = { { side = "W", width = 12 } } })
+	for _, x in ipairs({ -30, 30 }) do lamp(f, gym + Vector3.new(x, 28, 0), Color3.fromRGB(255, 240, 200)) end
+	scatterCover(f, rng, gym, Vector2.new(70, 50), 5, { gym }, { name = "Bleacher", minW = 6, maxW = 14, minH = 3, maxH = 5,
+		material = Enum.Material.Wood, color = Color3.fromRGB(120, 90, 60) })
+	-- Library sits on the hallway roof; outdoor stairs on the west side lead up to it
+	local libC = o + Vector3.new(-50, 15, 0)
+	part(f, { Name = "StairBase", Size = Vector3.new(50, 1, 30), CFrame = CFrame.new(o + Vector3.new(-105, -0.5, 0)),
+		Material = Enum.Material.Concrete, Color = Color3.fromRGB(80, 80, 80) })
+	for i = 0, 9 do
+		part(f, { Name = "Stair", Size = Vector3.new(4, 1.5, 5),
+			CFrame = CFrame.new(o + Vector3.new(-122 + i * 4, 0.75 + i * 1.5, -9)), Color = Color3.fromRGB(120, 115, 110) })
+	end
+	part(f, { Name = "Landing", Size = Vector3.new(8, 1, 18), CFrame = CFrame.new(o + Vector3.new(-84, 14.5, -2)),
+		Color = Color3.fromRGB(120, 115, 110) })
+	-- West hallway end wall with a door (the stairwell is reached from here)
+	for _, z in ipairs({ -8, 8 }) do
+		part(f, { Name = "Wall", Size = Vector3.new(2, 14, 6), CFrame = CFrame.new(o + Vector3.new(-81, 7, z)), Color = wallC })
+	end
+	room(f, libC, Vector3.new(60, 12, 36), { ceiling = true, wallColor = Color3.fromRGB(110, 90, 70),
+		floorMaterial = Enum.Material.Carpet, floorColor = Color3.fromRGB(90, 30, 30),
+		doors = { { side = "W", width = 10 } } })
+	for dx = -20, 20, 10 do
+		part(f, { Name = "Bookshelf", Size = Vector3.new(2, 9, 12), CFrame = CFrame.new(libC + Vector3.new(dx, 4.5, 0)),
+			Material = Enum.Material.Wood, Color = Color3.fromRGB(80, 55, 35) })
+	end
+	lamp(f, libC + Vector3.new(0, 11, 0), Color3.fromRGB(255, 200, 120))
+
+	L.nests = { classrooms[4] + Vector3.new(0, 2, 0), gym + Vector3.new(0, 2, 20), libC + Vector3.new(25, 2, 0) }
+	L.playerSpawns = { CFrame.new(o + Vector3.new(-100, 3, 6)), CFrame.new(o + Vector3.new(-100, 3, 10)),
+		CFrame.new(o + Vector3.new(-96, 3, 6)), CFrame.new(o + Vector3.new(-96, 3, 10)) }
+	L.curseSpawns = { classrooms[1], classrooms[2], classrooms[5], classrooms[6], gym, libC + Vector3.new(0, 2, 0) }
+	L.size = Vector3.new(320, 40, 120)
+	return L
+end
+
+--[[ NightMarket (Escort)
+	A winding street lined with stalls under strings of lanterns. The escort path follows
+	the street through three "ambush squares", the open plazas where ambushes trigger.
+	The stalls give cover and block sightlines so ambushes can come from the sides. ]]
+Themes.NightMarket = function(f, o, rng)
+	local L = {}
+	local path = {
+		o + Vector3.new(-160, 3, 0), o + Vector3.new(-90, 3, 0), o + Vector3.new(-60, 3, 40),
+		o + Vector3.new(0, 3, 40), o + Vector3.new(40, 3, -10), o + Vector3.new(100, 3, -10),
+		o + Vector3.new(160, 3, 30),
+	}
+	part(f, { Name = "Street", Size = Vector3.new(380, 1, 160), CFrame = CFrame.new(o - Vector3.new(0, 0.5, 0)),
+		Material = Enum.Material.Cobblestone, Color = Color3.fromRGB(70, 65, 60) })
+	-- Stalls along each segment, offset to both sides of the path
+	local lanternColors = { Color3.fromRGB(255, 120, 60), Color3.fromRGB(255, 70, 90), Color3.fromRGB(255, 200, 80) }
+	for i = 1, #path - 1 do
+		local a, b = path[i], path[i + 1]
+		local dir = (b - a).Unit
+		local side = Vector3.new(-dir.Z, 0, dir.X)
+		local len = (b - a).Magnitude
+		for t = 8, len - 8, 14 do
+			for _, s in ipairs({ -1, 1 }) do
+				if rng:NextNumber() > 0.2 then
+					local p = a + dir * t + side * s * 16
+					local cf = CFrame.lookAt(p, p + dir) 
+					part(f, { Name = "StallCounter", Size = Vector3.new(8, 3.5, 4), CFrame = cf * CFrame.new(0, -1.25, 0),
+						Material = Enum.Material.Wood, Color = Color3.fromRGB(110, 70, 40) })
+					part(f, { Name = "StallAwning", Size = Vector3.new(9, 0.4, 6), CFrame = cf * CFrame.new(0, 5, 0) * CFrame.Angles(math.rad(s * 10), 0, 0),
+						Material = Enum.Material.Fabric, Color = lanternColors[rng:NextInteger(1, 3)] })
+				end
+			end
+			lamp(f, a + dir * t + Vector3.new(0, 12, 0), lanternColors[rng:NextInteger(1, 3)])
+		end
+	end
+	-- Buildings framing the market (just facades)
+	for x = -180, 180, 30 do
+		for _, z in ipairs({ -78, 78 }) do
+			local h = rng:NextNumber(20, 45)
+			part(f, { Name = "Building", Size = Vector3.new(28, h, 10), CFrame = CFrame.new(o + Vector3.new(x, h / 2, z)),
+				Material = Enum.Material.Brick, Color = Color3.fromRGB(80 + rng:NextInteger(0, 30), 60, 55) })
+		end
+	end
+	-- Ambush squares (open plazas)
+	L.ambushPoints = { path[3], path[5], path[6] }
+	for _, p in ipairs(L.ambushPoints) do
+		part(f, { Name = "PlazaMark", Size = Vector3.new(30, 0.2, 30), CFrame = CFrame.new(p - Vector3.new(0, 2.85, 0)),
+			Material = Enum.Material.Granite, Color = Color3.fromRGB(90, 85, 80), CanCollide = false })
+	end
+	local ext = part(f, { Name = "Extraction", Size = Vector3.new(16, 0.4, 16), CFrame = CFrame.new(path[#path] - Vector3.new(0, 2.7, 0)),
+		Material = Enum.Material.Neon, Color = Color3.fromRGB(90, 255, 160), CanCollide = false })
+	light(ext, Color3.fromRGB(90, 255, 160), 30, 2)
+
+	L.escortPath = path
+	L.playerSpawns = { CFrame.new(path[1] + Vector3.new(-6, 0, 0)), CFrame.new(path[1] + Vector3.new(-6, 0, 5)),
+		CFrame.new(path[1] + Vector3.new(-6, 0, -5)), CFrame.new(path[1] + Vector3.new(-10, 0, 0)) }
+	L.curseSpawns = {}
+	for _, p in ipairs(L.ambushPoints) do
+		table.insert(L.curseSpawns, p + Vector3.new(0, 0, 40))
+		table.insert(L.curseSpawns, p + Vector3.new(0, 0, -40))
+	end
+	L.size = Vector3.new(380, 50, 160)
+	return L
+end
+
+--[[ FloodedShrine (Warding)
+	A shrine courtyard sunk into shallow water. The Ward Stone sits on a raised dais in the middle,
+	and three causeways lead in from torii-style gates (the curse spawns), so you can see which way
+	each wave is coming from. ]]
+Themes.FloodedShrine = function(f, o, rng)
+	local L = {}
+	part(f, { Name = "Water", Size = Vector3.new(260, 1, 260), CFrame = CFrame.new(o - Vector3.new(0, 1.5, 0)),
+		Material = Enum.Material.Glass, Color = Color3.fromRGB(30, 60, 70), Transparency = 0.3 })
+	part(f, { Name = "Seabed", Size = Vector3.new(260, 1, 260), CFrame = CFrame.new(o - Vector3.new(0, 3, 0)),
+		Material = Enum.Material.Mud, Color = Color3.fromRGB(40, 40, 30) })
+	-- Central dais
+	part(f, { Name = "Dais", Size = Vector3.new(50, 3, 50), CFrame = CFrame.new(o + Vector3.new(0, -0.5, 0)),
+		Material = Enum.Material.Slate, Color = Color3.fromRGB(80, 85, 80) })
+	local ward = part(f, { Name = "WardStone", Size = Vector3.new(6, 10, 6), CFrame = CFrame.new(o + Vector3.new(0, 6, 0)),
+		Material = Enum.Material.Marble, Color = Color3.fromRGB(220, 220, 210) })
+	light(ward, Color3.fromRGB(150, 220, 255), 40, 2)
+	-- Causeways and gates
+	local gates = {}
+	for i = 0, 2 do
+		local ang = math.rad(90 + i * 120)
+		local dir = Vector3.new(math.cos(ang), 0, math.sin(ang))
+		local mid = o + dir * 65
+		part(f, { Name = "Causeway", Size = Vector3.new(14, 2, 80),
+			CFrame = CFrame.lookAt(mid - Vector3.new(0, 1, 0), mid - Vector3.new(0, 1, 0) + dir),
+			Material = Enum.Material.Cobblestone, Color = Color3.fromRGB(90, 90, 85) })
+		local gatePos = o + dir * 110
+		local cf = CFrame.lookAt(gatePos, gatePos + dir)
+		for _, s in ipairs({ -1, 1 }) do
+			part(f, { Name = "GatePost", Size = Vector3.new(2, 18, 2), CFrame = cf * CFrame.new(s * 7, 9, 0),
+				Material = Enum.Material.Wood, Color = Color3.fromRGB(170, 40, 30) })
+		end
+		part(f, { Name = "GateBeam", Size = Vector3.new(20, 2, 2.5), CFrame = cf * CFrame.new(0, 18, 0),
+			Material = Enum.Material.Wood, Color = Color3.fromRGB(170, 40, 30) })
+		lamp(f, gatePos + Vector3.new(0, 16, 0), Color3.fromRGB(255, 100, 80))
+		part(f, { Name = "GateLanding", Size = Vector3.new(26, 2, 20), CFrame = cf * CFrame.new(0, -1, 4),
+			Material = Enum.Material.Cobblestone, Color = Color3.fromRGB(90, 90, 85) })
+		table.insert(gates, gatePos + Vector3.new(0, 3, 0))
+	end
+	-- Stone lanterns on the dais, used as cover
+	for i = 0, 7 do
+		local a = math.rad(i * 45 + 22.5)
+		local p = o + Vector3.new(math.cos(a) * 20, 0, math.sin(a) * 20)
+		part(f, { Name = "StoneLantern", Size = Vector3.new(2.5, 5, 2.5), CFrame = CFrame.new(p + Vector3.new(0, 3.5, 0)),
+			Material = Enum.Material.Slate, Color = Color3.fromRGB(110, 110, 105) })
+	end
+	scatterCover(f, rng, o - Vector3.new(0, 1, 0), Vector2.new(200, 200), 10, { o }, { name = "Rock",
+		material = Enum.Material.Rock, color = Color3.fromRGB(70, 70, 65), minH = 2, maxH = 5 })
+
+	L.ward = ward.Position
+	L.wardPart = ward
+	L.playerSpawns = { CFrame.new(o + Vector3.new(8, 3, 8)), CFrame.new(o + Vector3.new(-8, 3, 8)),
+		CFrame.new(o + Vector3.new(8, 3, -8)), CFrame.new(o + Vector3.new(-8, 3, -8)) }
+	L.curseSpawns = gates
+	L.size = Vector3.new(260, 40, 260)
+	return L
+end
+
+--[[ RooftopCathedral (Calamity)
+	A ring of rooftops around a cathedral bell tower. The boss arena is the wide central roof.
+	The outer rooftops are connected by narrow beams so players can reposition, but falling
+	means a long walk back. ]]
+Themes.RooftopCathedral = function(f, o, rng)
+	local L = {}
+	local roofY = 0
+	part(f, { Name = "ArenaRoof", Size = Vector3.new(110, 2, 110), CFrame = CFrame.new(o + Vector3.new(0, roofY - 1, 0)),
+		Material = Enum.Material.Slate, Color = Color3.fromRGB(60, 60, 70) })
+	-- Low parapet around the arena with gaps
+	for i = 0, 15 do
+		if i % 4 ~= 0 then
+			local a = math.rad(i * 22.5)
+			local p = o + Vector3.new(math.cos(a) * 54, 1.5, math.sin(a) * 54)
+			part(f, { Name = "Parapet", Size = Vector3.new(20, 3, 2), CFrame = CFrame.lookAt(p, o + Vector3.new(0, 1.5, 0)),
+				Material = Enum.Material.Brick, Color = Color3.fromRGB(90, 80, 75) })
+		end
+	end
+	-- Bell tower at the north edge, visible from anywhere on the map
+	local tower = o + Vector3.new(0, 0, -75)
+	part(f, { Name = "Tower", Size = Vector3.new(24, 80, 24), CFrame = CFrame.new(tower + Vector3.new(0, 40, 0)),
+		Material = Enum.Material.Brick, Color = Color3.fromRGB(80, 70, 65) })
+	local bell = part(f, { Name = "Bell", Size = Vector3.new(14, 14, 14), Shape = Enum.PartType.Ball,
+		CFrame = CFrame.new(tower + Vector3.new(0, 72, 12)), Material = Enum.Material.Metal, Color = Color3.fromRGB(140, 110, 50) })
+	light(bell, Color3.fromRGB(255, 200, 100), 60, 2)
+	-- Outer rooftops
+	local outer = {}
+	for i = 0, 5 do
+		local a = math.rad(i * 60 + 30)
+		local p = o + Vector3.new(math.cos(a) * 110, rng:NextNumber(-6, 6), math.sin(a) * 110)
+		part(f, { Name = "OuterRoof", Size = Vector3.new(40, 2, 40), CFrame = CFrame.new(p - Vector3.new(0, 1, 0)),
+			Material = Enum.Material.Slate, Color = Color3.fromRGB(70, 65, 70) })
+		lamp(f, p + Vector3.new(0, 8, 0), Color3.fromRGB(180, 160, 255))
+		table.insert(outer, p)
+		-- Beam back to the arena
+		local mid = (p + o) / 2
+		part(f, { Name = "Beam", Size = Vector3.new(3, 1, (p - o).Magnitude - 90),
+			CFrame = CFrame.lookAt(mid - Vector3.new(0, 0.5, 0), o - Vector3.new(0, 0.5, 0)), Material = Enum.Material.Wood,
+			Color = Color3.fromRGB(90, 70, 50) })
+	end
+	scatterCover(f, rng, o, Vector2.new(80, 80), 6, { o }, { name = "Chimney", minW = 3, maxW = 5, minH = 6, maxH = 10,
+		material = Enum.Material.Brick, color = Color3.fromRGB(100, 70, 60) })
+
+	L.bossSpawn = o + Vector3.new(0, 4, -30)
+	L.playerSpawns = { CFrame.new(o + Vector3.new(0, 3, 40)), CFrame.new(o + Vector3.new(6, 3, 40)),
+		CFrame.new(o + Vector3.new(-6, 3, 40)), CFrame.new(o + Vector3.new(0, 3, 46)) }
+	L.curseSpawns = outer
+	L.size = Vector3.new(300, 100, 300)
+	return L
+end
+
+----------------------------------------------------------------------
+function MapBuilder:Build(themeId: string, origin: Vector3, seed: number?)
+	local builder = Themes[themeId]
+	assert(builder, "Unknown map theme " .. tostring(themeId))
+	local folder = Instance.new("Folder")
+	folder.Name = "Map_" .. themeId
+	local rng = Random.new(seed or os.time())
+	local layout = builder(folder, origin, rng)
+	layout.folder = folder
+	layout.bounds = { center = origin, size = layout.size }
+	layout.killFloor = killFloor(folder, origin, layout.size)
+	folder.Parent = workspace
+	return layout
+end
+
+-- Hub: the "Sanctum", a walled courtyard with the mission board, the Lineage roll shrine and a sparring ring
+function MapBuilder:BuildHub(origin: Vector3)
+	local f = Instance.new("Folder")
+	f.Name = "Hub"
+	room(f, origin, Vector3.new(160, 24, 160), { wallMaterial = Enum.Material.Brick, wallColor = Color3.fromRGB(110, 90, 80),
+		floorMaterial = Enum.Material.Cobblestone, floorColor = Color3.fromRGB(95, 90, 85) })
+	local board = part(f, { Name = "MissionBoard", Size = Vector3.new(16, 10, 1.5),
+		CFrame = CFrame.new(origin + Vector3.new(0, 5, -60)), Material = Enum.Material.Wood, Color = Color3.fromRGB(100, 70, 45) })
+	lamp(f, board.Position + Vector3.new(0, 7, 3), Color3.fromRGB(255, 200, 120))
+	local shrine = part(f, { Name = "RollShrine", Size = Vector3.new(8, 12, 8),
+		CFrame = CFrame.new(origin + Vector3.new(55, 6, 0)), Material = Enum.Material.Marble, Color = Color3.fromRGB(230, 225, 215) })
+	light(shrine, Color3.fromRGB(200, 120, 255), 30, 2)
+	-- Sparring ring
+	part(f, { Name = "SparRing", Size = Vector3.new(40, 1, 40), CFrame = CFrame.new(origin + Vector3.new(-50, 0, 20)),
+		Material = Enum.Material.Sand, Color = Color3.fromRGB(170, 150, 110) })
+	for _, c in ipairs({ Vector3.new(-20, 0, -20), Vector3.new(20, 0, -20), Vector3.new(-20, 0, 20), Vector3.new(20, 0, 20) }) do
+		part(f, { Name = "RingPost", Size = Vector3.new(1.5, 6, 1.5), CFrame = CFrame.new(origin + Vector3.new(-50, 3, 20) + c),
+			Material = Enum.Material.Wood, Color = Color3.fromRGB(150, 40, 30) })
+	end
+	f.Parent = workspace
+	return { folder = f, spawn = CFrame.new(origin + Vector3.new(0, 3, 40)), missionBoard = board, rollShrine = shrine }
+end
+
+MapBuilder.Themes = Themes
+return MapBuilder
