@@ -1,0 +1,556 @@
+--!nonstrict
+--[[
+	MissionService  (ServerScriptService/Services/MissionService)
+	HEXBOUND - the mission board, party lobbies, separate map instances, objectives, and rewards.
+
+	Remote MissionRequest (C->S):
+	  ("Host", missionId)          -- opens a lobby (LOBBY_TIME seconds) that others can join
+	  ("Join", hostUserId)
+	  ("Leave")                    -- leave the lobby, or abandon the mission (no rewards)
+	  ("Launch")                   -- the host starts early
+	Remote MissionUpdate (S->C): (event, payload)
+	  "OpenBoard"  { missions, lobbies }      -- the board's ProximityPrompt was used
+	  "OpenRoll"                               -- the roll shrine's ProximityPrompt was used
+	  "Lobby"      { missionId, host, members, launchesIn }
+	  "Started"    { missionId, type, timeLimit }
+	  "Objective"  { text, progress, goal }
+	  "Ended"      { success, reason, rewards? }
+
+	Rules (assumed defaults):
+	  * Dying during a mission removes you from it: you respawn in the hub and get no rewards.
+	  * The mission fails when no party members remain, the objective dies, or time runs out.
+	  * Everyone still in the mission at completion gets the full rewards (rewards aren't split).
+	  * Curse kills give their XP immediately to every remaining party member.
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local MissionData = require(ReplicatedStorage.Shared.MissionData)
+local Services = ServerScriptService.Services
+local PlayerDataService = require(Services.PlayerDataService)
+local ProgressionService = require(Services.ProgressionService)
+local InventoryService = require(Services.InventoryService)
+local RollService = require(Services.RollService)
+local TradeService = require(Services.TradeService)
+local CurseAI = require(Services.CurseAI)
+local MapBuilder = require(Services.MapBuilder)
+
+local Remotes = ReplicatedStorage.Remotes
+local function remote(name)
+	local r = Remotes:FindFirstChild(name) or Instance.new("RemoteEvent")
+	r.Name = name
+	r.Parent = Remotes
+	return r
+end
+local MissionRequest = remote("MissionRequest")
+local MissionUpdate = remote("MissionUpdate")
+
+local LOBBY_TIME = 15
+local MAX_INSTANCES = 12
+local HUB_ORIGIN = Vector3.new(0, 0, 0)
+
+local MissionService = {}
+local hub = nil
+local lobbies = {}       -- [hostPlayer] = lobby
+local runs = {}          -- [runId] = run
+local playerRun = {}     -- [Player] = run
+local playerLobby = {}   -- [Player] = lobby
+local slots = {}         -- [slotIndex] = run
+local nextRunId = 0
+
+local function send(players, event, payload)
+	for _, p in ipairs(players) do
+		if p.Parent then MissionUpdate:FireClient(p, event, payload) end
+	end
+end
+
+local function memberList(set)
+	local list = {}
+	for p in pairs(set) do table.insert(list, p) end
+	return list
+end
+
+function MissionService:IsInMission(player) return playerRun[player] ~= nil end
+
+----------------------------------------------------------------------
+-- Lobbies
+----------------------------------------------------------------------
+local function lobbyPayload(lobby)
+	local ids = {}
+	for p in pairs(lobby.members) do table.insert(ids, p.UserId) end
+	return { missionId = lobby.missionId, host = lobby.host.UserId, members = ids,
+		launchesIn = math.max(0, math.ceil(lobby.launchAt - os.clock())) }
+end
+
+local function disbandLobby(lobby, reason)
+	for p in pairs(lobby.members) do playerLobby[p] = nil end
+	lobbies[lobby.host] = nil
+	lobby.closed = true
+	send(memberList(lobby.members), "Lobby", { closed = true, reason = reason })
+end
+
+local function eligible(player, mission)
+	local data = PlayerDataService:GetProfile(player)
+	if not data then return false, "NoProfile" end
+	if data.level < mission.minLevel then return false, "LevelTooLow" end
+	if playerRun[player] or playerLobby[player] then return false, "Busy" end
+	if TradeService:IsTrading(player) then return false, "InTrade" end
+	local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+	if not hum or hum.Health <= 0 then return false, "Dead" end
+	return true
+end
+
+local launch -- forward declaration
+
+local function host(player, missionId)
+	local mission = MissionData.Missions[missionId]
+	if type(missionId) ~= "string" or not mission then return end
+	local ok, reason = eligible(player, mission)
+	if not ok then return send({ player }, "Error", reason) end
+
+	local lobby = { host = player, missionId = missionId, members = { [player] = true },
+		launchAt = os.clock() + LOBBY_TIME, closed = false }
+	lobbies[player] = lobby
+	playerLobby[player] = lobby
+	send({ player }, "Lobby", lobbyPayload(lobby))
+	task.delay(LOBBY_TIME, function()
+		if not lobby.closed then launch(lobby) end
+	end)
+end
+
+local function join(player, hostUserId)
+	if type(hostUserId) ~= "number" then return end
+	local hostPlayer = Players:GetPlayerByUserId(hostUserId)
+	local lobby = hostPlayer and lobbies[hostPlayer]
+	if not lobby or lobby.closed then return end
+	if #memberList(lobby.members) >= MissionData.MaxPartySize then return send({ player }, "Error", "LobbyFull") end
+	local ok, reason = eligible(player, MissionData.Missions[lobby.missionId])
+	if not ok then return send({ player }, "Error", reason) end
+	lobby.members[player] = true
+	playerLobby[player] = lobby
+	send(memberList(lobby.members), "Lobby", lobbyPayload(lobby))
+end
+
+local function leaveLobby(player)
+	local lobby = playerLobby[player]
+	if not lobby then return end
+	if lobby.host == player then return disbandLobby(lobby, "HostLeft") end
+	lobby.members[player] = nil
+	playerLobby[player] = nil
+	send({ player }, "Lobby", { closed = true, reason = "Left" })
+	send(memberList(lobby.members), "Lobby", lobbyPayload(lobby))
+end
+
+----------------------------------------------------------------------
+-- Runs
+----------------------------------------------------------------------
+local function aliveParty(run)
+	local list = {}
+	for p in pairs(run.party) do
+		local hum = p.Character and p.Character:FindFirstChildOfClass("Humanoid")
+		if hum and hum.Health > 0 then table.insert(list, p) end
+	end
+	return list
+end
+
+local function partyCharacters(run)
+	local list = {}
+	for _, p in ipairs(aliveParty(run)) do table.insert(list, p.Character) end
+	-- Objectives can also be targeted
+	if run.objectiveModel and run.objectiveModel.Parent then table.insert(list, run.objectiveModel) end
+	return list
+end
+
+local function objective(run, text, progress, goal)
+	run.objectiveText = { text = text, progress = progress, goal = goal }
+	send(memberList(run.party), "Objective", run.objectiveText)
+end
+
+local function teleportToHub(player)
+	local char = player.Character
+	if char and hub then char:PivotTo(hub.spawn + Vector3.new(math.random(-8, 8), 0, math.random(-4, 4))) end
+end
+
+local function grantRewards(run)
+	local mission = run.mission
+	local results = {}
+	for _, p in ipairs(memberList(run.party)) do
+		local drops = RollService:RollDrops(mission.rewards.drops, mission.rewards.rolls, MissionData.DropTables)
+		for _, d in ipairs(drops) do InventoryService:AddItem(p, d.item, d.qty) end
+		ProgressionService:AddXP(p, mission.rewards.xp)
+		ProgressionService:AddMarks(p, mission.rewards.marks)
+		local data = PlayerDataService:GetProfile(p)
+		if data then data.missionsCompleted += 1; PlayerDataService:MarkDirty(p) end
+		results[p] = { xp = mission.rewards.xp, marks = mission.rewards.marks, drops = drops }
+	end
+	return results
+end
+
+local function endRun(run, success: boolean, reason: string)
+	if run.ended then return end
+	run.ended = true
+	local rewards = success and grantRewards(run) or {}
+	for _, p in ipairs(memberList(run.party)) do
+		MissionUpdate:FireClient(p, "Ended", { success = success, reason = reason, rewards = rewards[p] })
+		p:SetAttribute("InMission", nil)
+		playerRun[p] = nil
+	end
+	-- Give players a moment to read the result screen, then send them back and clean up
+	task.delay(5, function()
+		for p in pairs(run.party) do if p.Parent then teleportToHub(p) end end
+		for m in pairs(run.curses) do CurseAI:Despawn(m) end
+		for _, c in ipairs(run.connections) do c:Disconnect() end
+		if run.layout and run.layout.folder then run.layout.folder:Destroy() end
+		slots[run.slot] = nil
+		runs[run.id] = nil
+	end)
+end
+
+local function removeFromRun(player, reason)
+	local run = playerRun[player]
+	if not run then return end
+	run.party[player] = nil
+	playerRun[player] = nil
+	player:SetAttribute("InMission", nil)
+	MissionUpdate:FireClient(player, "Ended", { success = false, reason = reason })
+	if next(run.party) == nil then endRun(run, false, "PartyWiped") end
+end
+
+-- Spawn a curse that is tracked by the run; onDeath runs once when it dies
+local function spawnCurse(run, curseId, pos, opts, onDeath)
+	opts = opts or {}
+	opts.parent = run.layout.folder
+	opts.getTargets = function() return partyCharacters(run) end
+	local model = CurseAI:Spawn(curseId, pos, opts)
+	run.curses[model] = true
+	local def = MissionData.Curses[curseId]
+	model:FindFirstChildOfClass("Humanoid").Died:Connect(function()
+		if not run.curses[model] then return end
+		run.curses[model] = nil
+		if run.ended then return end
+		for _, p in ipairs(aliveParty(run)) do
+			ProgressionService:AddXP(p, def.xp)
+			ProgressionService:AddMarks(p, def.marks)
+			local data = PlayerDataService:GetProfile(p)
+			if data then data.stats_lifetime.curseKills += 1 end
+		end
+		if onDeath then onDeath(model) end
+	end)
+	return model
+end
+
+local function countAlive(run)
+	local n = 0
+	for _ in pairs(run.curses) do n += 1 end
+	return n
+end
+
+local function randomSpawn(run)
+	local spawns = run.layout.curseSpawns
+	return spawns[math.random(1, #spawns)] + Vector3.new(math.random(-4, 4), 0, math.random(-4, 4))
+end
+
+-- Expand a roster { Gnawer = 6, Weeper = 4 } into a shuffled list of ids
+local function expandRoster(roster)
+	local list = {}
+	for id, n in pairs(roster) do for _ = 1, n do table.insert(list, id) end end
+	for i = #list, 2, -1 do
+		local j = math.random(1, i)
+		list[i], list[j] = list[j], list[i]
+	end
+	return list
+end
+
+----------------------------------------------------------------------
+-- Mission types: run(run) is a coroutine that calls endRun when it finishes
+----------------------------------------------------------------------
+local Types = {}
+
+Types.Exorcism = function(run)
+	local m = run.mission
+	local queue = expandRoster(m.roster)
+	local kills = 0
+	objective(run, "Exorcise the curses", 0, m.killTarget)
+	while not run.ended do
+		while countAlive(run) < m.maxAlive and #queue > 0 do
+			spawnCurse(run, table.remove(queue), randomSpawn(run), nil, function()
+				kills += 1
+				objective(run, "Exorcise the curses", kills, m.killTarget)
+				if kills >= m.killTarget then endRun(run, true, "Complete") end
+			end)
+			task.wait(0.4)
+		end
+		task.wait(1)
+	end
+end
+
+Types.PurgeNest = function(run)
+	local m = run.mission
+	local nestDef = MissionData.Curses.Nest
+	local remaining = 0
+	local nests = {}
+	for i = 1, math.min(m.nests, #run.layout.nests) do
+		local nest = CurseAI:SpawnStructure("Curse Nest", run.layout.nests[i], nestDef.health, "Curse",
+			{ parent = run.layout.folder, size = Vector3.new(7, 9, 7), color = Color3.fromRGB(110, 10, 50) })
+		remaining += 1
+		nests[nest] = true
+		nest:FindFirstChildOfClass("Humanoid").Died:Connect(function()
+			nests[nest] = nil
+			remaining -= 1
+			for _, p in ipairs(aliveParty(run)) do ProgressionService:AddXP(p, nestDef.xp) end
+			task.delay(1, function() nest:Destroy() end)
+			objective(run, "Destroy the Curse Nests", m.nests - remaining, m.nests)
+			if remaining <= 0 and not run.ended then endRun(run, true, "Complete") end
+		end)
+	end
+	objective(run, "Destroy the Curse Nests", 0, m.nests)
+	while not run.ended do
+		task.wait(m.nestInterval)
+		for nest in pairs(nests) do
+			for id, n in pairs(m.nestSpawn) do
+				for _ = 1, n do
+					if countAlive(run) < m.maxAlive and nest.Parent then
+						spawnCurse(run, id, nest:GetPivot().Position + Vector3.new(math.random(-8, 8), 0, math.random(-8, 8)))
+					end
+				end
+			end
+		end
+	end
+end
+
+Types.Escort = function(run)
+	local m = run.mission
+	local path = run.layout.escortPath
+	local civ = CurseAI:Spawn_Civilian(path[1], m.civilianHealth, run.layout.folder)
+	run.objectiveModel = civ
+	local civHum = civ:FindFirstChildOfClass("Humanoid")
+	civHum.Died:Connect(function() endRun(run, false, "CivilianDied") end)
+
+	-- Ambushes trigger at the path node closest to each ambush point
+	local ambushAt = {}
+	for _, ap in ipairs(run.layout.ambushPoints or {}) do
+		local bestI, bestD = nil, math.huge
+		for i, p in ipairs(path) do
+			local d = (p - ap).Magnitude
+			if d < bestD then bestI, bestD = i, d end
+		end
+		ambushAt[bestI] = true
+	end
+
+	local ambushesLeft = m.ambushes
+	for i = 2, #path do
+		if run.ended then return end
+		objective(run, "Escort the civilian to safety", i - 1, #path - 1)
+		-- The civilian only moves while a sorcerer is within 25 studs (they're scared)
+		while not run.ended do
+			local near = false
+			for _, p in ipairs(aliveParty(run)) do
+				if (p.Character:GetPivot().Position - civ:GetPivot().Position).Magnitude < 25 then near = true break end
+			end
+			if near then
+				civHum:MoveTo(path[i])
+				if (civ:GetPivot().Position - path[i]).Magnitude < 5 then break end
+			else
+				civHum:MoveTo(civ:GetPivot().Position)
+			end
+			task.wait(0.3)
+		end
+		if ambushAt[i] and ambushesLeft > 0 and not run.ended then
+			ambushesLeft -= 1
+			civHum:MoveTo(civ:GetPivot().Position)
+			objective(run, "Ambush! Protect the civilian", 0, 1)
+			for _, id in ipairs(expandRoster(m.ambushRoster)) do
+				local pos = path[i] + Vector3.new(math.random(-30, 30), 0, (math.random() < 0.5 and -1 or 1) * math.random(25, 40))
+				spawnCurse(run, id, pos, { preferObjective = civ })
+			end
+			while countAlive(run) > 0 and not run.ended do task.wait(0.5) end
+		end
+	end
+	if not run.ended then endRun(run, true, "Complete") end
+end
+
+Types.Warding = function(run)
+	local m = run.mission
+	local ward = CurseAI:SpawnStructure("Ward Stone", run.layout.ward - Vector3.new(0, 5, 0), m.wardHealth, "Sorcerer",
+		{ parent = run.layout.folder, size = Vector3.new(6, 10, 6), material = Enum.Material.Marble,
+		  color = Color3.fromRGB(220, 220, 210) })
+	if run.layout.wardPart then run.layout.wardPart:Destroy() end -- swap the decorative stone for the damageable one
+	run.objectiveModel = ward
+	ward:FindFirstChildOfClass("Humanoid").Died:Connect(function() endRun(run, false, "WardFell") end)
+
+	for w, roster in ipairs(m.waves) do
+		if run.ended then return end
+		objective(run, ("Wave %d incoming"):format(w), w - 1, #m.waves)
+		task.wait(m.waveDelay)
+		for _, id in ipairs(expandRoster(roster)) do
+			if run.ended then return end
+			spawnCurse(run, id, randomSpawn(run), { preferObjective = ward })
+			task.wait(0.6)
+		end
+		objective(run, ("Hold the Ward - wave %d"):format(w), w - 1, #m.waves)
+		while countAlive(run) > 0 and not run.ended do task.wait(0.5) end
+	end
+	if not run.ended then endRun(run, true, "Complete") end
+end
+
+Types.Calamity = function(run)
+	local m = run.mission
+	local bossDef = MissionData.Curses[m.boss]
+	objective(run, "Exorcise " .. bossDef.name, 0, 1)
+	spawnCurse(run, m.boss, run.layout.bossSpawn, {
+		onPhase = function(phase)
+			objective(run, ("%s grows furious (phase %d)"):format(bossDef.name, phase + 1), 0, 1)
+			if m.addsAtPhase then
+				for _, id in ipairs(expandRoster(m.adds)) do spawnCurse(run, id, randomSpawn(run)) end
+			end
+		end,
+	}, function()
+		endRun(run, true, "Complete")
+	end)
+end
+
+----------------------------------------------------------------------
+-- Launch
+----------------------------------------------------------------------
+launch = function(lobby)
+	if lobby.closed then return end
+	disbandLobby(lobby, "Launched")
+	local mission = MissionData.Missions[lobby.missionId]
+
+	-- Members who can no longer go (died or started trading during the lobby) are dropped
+	local party = {}
+	for p in pairs(lobby.members) do
+		local hum = p.Parent and p.Character and p.Character:FindFirstChildOfClass("Humanoid")
+		if hum and hum.Health > 0 and not TradeService:IsTrading(p) then party[p] = true end
+	end
+	if next(party) == nil then return end
+
+	local slot
+	for i = 1, MAX_INSTANCES do if not slots[i] then slot = i break end end
+	if not slot then return send(memberList(party), "Error", "ServerBusy") end
+
+	nextRunId += 1
+	local origin = Vector3.new(slot * MissionData.Instancing.spacing, MissionData.Instancing.baseY, 0)
+	local run = { id = nextRunId, slot = slot, mission = mission, missionId = lobby.missionId, party = party,
+		curses = {}, connections = {}, ended = false }
+	slots[slot] = run
+	runs[run.id] = run
+
+	run.layout = MapBuilder:Build(mission.map, origin, run.id)
+
+	-- Kill floor: send people who fall back to a spawn; curses that fall are removed
+	table.insert(run.connections, run.layout.killFloor.Touched:Connect(function(hit)
+		local model = hit:FindFirstAncestorOfClass("Model")
+		if not model then return end
+		local player = Players:GetPlayerFromCharacter(model)
+		if player and run.party[player] then
+			model:PivotTo(run.layout.playerSpawns[1])
+		elseif run.curses[model] then
+			model:PivotTo(CFrame.new(randomSpawn(run) + Vector3.new(0, 3, 0)))
+		end
+	end))
+
+	local i = 0
+	for p in pairs(party) do
+		i += 1
+		playerRun[p] = run
+		p:SetAttribute("InMission", lobby.missionId)
+		p.Character:PivotTo(run.layout.playerSpawns[((i - 1) % #run.layout.playerSpawns) + 1])
+	end
+	send(memberList(party), "Started", { missionId = lobby.missionId, type = mission.type, timeLimit = mission.timeLimit })
+
+	task.spawn(Types[mission.type], run)
+	task.delay(mission.timeLimit, function()
+		if not run.ended then endRun(run, false, "TimeUp") end
+	end)
+end
+
+----------------------------------------------------------------------
+-- Board and remote
+----------------------------------------------------------------------
+local function boardPayload()
+	local missions = {}
+	for id, m in pairs(MissionData.Missions) do
+		table.insert(missions, { id = id, name = m.name, type = m.type, minLevel = m.minLevel, rewards = m.rewards })
+	end
+	table.sort(missions, function(a, b) return a.minLevel < b.minLevel end)
+	local open = {}
+	for _, lobby in pairs(lobbies) do table.insert(open, lobbyPayload(lobby)) end
+	return { missions = missions, lobbies = open }
+end
+
+local function onRequest(player, action, arg)
+	if action == "Host" then host(player, arg)
+	elseif action == "Join" then join(player, arg)
+	elseif action == "Launch" then
+		local lobby = lobbies[player]
+		if lobby then launch(lobby) end
+	elseif action == "Leave" then
+		if playerRun[player] then
+			removeFromRun(player, "Abandoned")
+			teleportToHub(player)
+		else
+			leaveLobby(player)
+		end
+	end
+end
+
+local function addPrompt(part, text, onTriggered)
+	local prompt = Instance.new("ProximityPrompt")
+	prompt.ActionText = text
+	prompt.MaxActivationDistance = 12
+	prompt.RequiresLineOfSight = false
+	prompt.Parent = part
+	prompt.Triggered:Connect(onTriggered)
+end
+
+function MissionService:Init()
+	hub = MapBuilder:BuildHub(HUB_ORIGIN)
+	addPrompt(hub.missionBoard, "Mission Board", function(p) MissionUpdate:FireClient(p, "OpenBoard", boardPayload()) end)
+	addPrompt(hub.rollShrine, "Roll Lineage", function(p) MissionUpdate:FireClient(p, "OpenRoll") end)
+
+	-- PvP is allowed only inside the sparring ring
+	local ring = hub.folder:FindFirstChild("SparRing")
+	task.spawn(function()
+		while true do
+			task.wait(0.5)
+			for _, p in ipairs(Players:GetPlayers()) do
+				local char = p.Character
+				if char and ring then
+					local rel = ring.CFrame:PointToObjectSpace(char:GetPivot().Position)
+					local inside = math.abs(rel.X) < ring.Size.X / 2 and math.abs(rel.Z) < ring.Size.Z / 2 and rel.Y < 10
+					char:SetAttribute("PvPEnabled", inside or nil)
+				end
+			end
+		end
+	end)
+
+	MissionRequest.OnServerEvent:Connect(onRequest)
+
+	-- No rolling or trading during missions
+	table.insert(RollService.BlockChecks, function(p) return playerRun[p] ~= nil, "InMission" end)
+	table.insert(TradeService.BlockChecks, function(p)
+		return playerRun[p] ~= nil or playerLobby[p] ~= nil, "InMission"
+	end)
+
+	local function hook(p)
+		p.CharacterAdded:Connect(function(char)
+			char:WaitForChild("HumanoidRootPart")
+			task.defer(teleportToHub, p)
+			char:WaitForChild("Humanoid").Died:Connect(function()
+				if playerRun[p] then removeFromRun(p, "Died") end
+				if playerLobby[p] then leaveLobby(p) end
+			end)
+		end)
+	end
+	Players.PlayerAdded:Connect(hook)
+	for _, p in ipairs(Players:GetPlayers()) do hook(p) end
+	Players.PlayerRemoving:Connect(function(p)
+		if playerRun[p] then removeFromRun(p, "Left") end
+		if playerLobby[p] then leaveLobby(p) end
+	end)
+end
+
+return MissionService
