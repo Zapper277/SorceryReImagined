@@ -1,0 +1,105 @@
+-- MusicController (LocalScript, StarterPlayerScripts)
+-- Zone-based ambient music with a combat layer that crossfades in when you're fighting.
+-- Respects Setting_MusicVolume (and Setting_MasterVolume) from SettingsController.
+--
+-- ZONES: Parts tagged "MusicZone" with attribute Track = "<key in TRACKS>". Being inside the part's box picks that track.
+--        Outside all zones -> TRACKS.Default. MapBuilder can create/tag these (invisible, CanCollide off).
+-- COMBAT: ASSUMPTION - your CombatService sets character attribute "InCombat" = true/false.
+--         Fallback: combat music for COMBAT_FALLBACK seconds after your Humanoid takes damage.
+-- NEEDS AUDIO: every ID below is a placeholder; nothing plays until you fill them in.
+
+local Players = game:GetService("Players")
+local SoundService = game:GetService("SoundService")
+local TweenService = game:GetService("TweenService")
+local CollectionService = game:GetService("CollectionService")
+local LP = Players.LocalPlayer
+
+local TRACKS = {
+	Default = { Id = "rbxassetid://0", Volume = 0.5 },
+	Hub     = { Id = "rbxassetid://0", Volume = 0.5 },
+	Tunnels = { Id = "rbxassetid://0", Volume = 0.6 },
+	Combat  = { Id = "rbxassetid://0", Volume = 0.7 },
+	Domain  = { Id = "rbxassetid://0", Volume = 0.8 },
+}
+local FADE = 1.5
+local COMBAT_FALLBACK = 8
+
+local group = Instance.new("SoundGroup")
+group.Name = "HexMusic"
+group.Parent = SoundService
+
+local function volumeScale()
+	local m = LP:GetAttribute("Setting_MusicVolume"); local master = LP:GetAttribute("Setting_MasterVolume")
+	return (type(m) == "number" and m or 0.5) * (type(master) == "number" and master or 1)
+end
+local function updateGroup() group.Volume = volumeScale() * 2 end -- *2 because 0.5 is the default slider value
+updateGroup()
+LP:GetAttributeChangedSignal("Setting_MusicVolume"):Connect(updateGroup)
+LP:GetAttributeChangedSignal("Setting_MasterVolume"):Connect(updateGroup)
+
+local sounds = {}
+for key, t in TRACKS do
+	local s = Instance.new("Sound")
+	s.Name = key; s.SoundId = t.Id; s.Looped = true; s.Volume = 0; s.SoundGroup = group; s.Parent = group
+	sounds[key] = s
+end
+
+local current = nil
+local function playTrack(key)
+	if current == key then return end
+	local def = TRACKS[key]
+	if not def or def.Id == "rbxassetid://0" then
+		-- placeholder: still fade out whatever was playing
+		if current and sounds[current] then TweenService:Create(sounds[current], TweenInfo.new(FADE), { Volume = 0 }):Play() end
+		current = key
+		return
+	end
+	if current and sounds[current] then
+		local old = sounds[current]
+		local tw = TweenService:Create(old, TweenInfo.new(FADE), { Volume = 0 })
+		tw:Play()
+		tw.Completed:Connect(function() if current ~= old.Name then old:Pause() end end)
+	end
+	current = key
+	local s = sounds[key]
+	if not s.IsPlaying then s:Play() end
+	TweenService:Create(s, TweenInfo.new(FADE), { Volume = def.Volume }):Play()
+end
+
+local function zoneTrack(pos: Vector3)
+	for _, z in CollectionService:GetTagged("MusicZone") do
+		if z:IsA("BasePart") then
+			local lp = z.CFrame:PointToObjectSpace(pos)
+			local h = z.Size / 2
+			if math.abs(lp.X) <= h.X and math.abs(lp.Y) <= h.Y and math.abs(lp.Z) <= h.Z then
+				local t = z:GetAttribute("Track")
+				if t and TRACKS[t] then return t end
+			end
+		end
+	end
+	return "Default"
+end
+
+local lastHurt = -math.huge
+local function hookChar(char)
+	local hum = char:WaitForChild("Humanoid", 10)
+	if not hum then return end
+	local last = hum.Health
+	hum.HealthChanged:Connect(function(h) if h < last then lastHurt = os.clock() end; last = h end)
+end
+LP.CharacterAdded:Connect(hookChar)
+if LP.Character then task.spawn(hookChar, LP.Character) end
+
+while true do
+	task.wait(0.5)
+	local char = LP.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if root then
+		local inDomain = workspace:FindFirstChild("DomainDomeFX") ~= nil
+			and (workspace.DomainDomeFX.Position - root.Position).Magnitude <= workspace.DomainDomeFX.Size.X / 2
+		local inCombat = char:GetAttribute("InCombat") == true or (os.clock() - lastHurt) < COMBAT_FALLBACK
+		if inDomain then playTrack("Domain")
+		elseif inCombat then playTrack("Combat")
+		else playTrack(zoneTrack(root.Position)) end
+	end
+end
