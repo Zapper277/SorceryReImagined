@@ -1,0 +1,45 @@
+--!nonstrict
+--[[
+	ItemData  (ReplicatedStorage/Shared/ItemData)
+	HEXBOUND - item definitions. Item types:
+	  Consumable : used from the inventory; `effect` is run by InventoryService
+	  Accessory  : equipped into `slot`; `stats` are added to Progression stats while equipped
+	  Material   : crafting / trade fodder
+	The server always decides `tradeable`.
+]]
+
+local ItemData = {}
+
+ItemData.Items = {
+	-- Consumables
+	SpinToken     = { name = "Lineage Spin", type = "Consumable", rarity = "Uncommon", stackable = true, maxStack = 99, tradeable = true,
+	                  effect = { kind = "AddSpins", amount = 1 }, description = "Adds one Lineage spin." },
+	HexDraught    = { name = "Hex Draught", type = "Consumable", rarity = "Common", stackable = true, maxStack = 20, tradeable = true,
+	                  effect = { kind = "RestoreHex", amount = 40 }, description = "Restores 40 Hex." },
+	MendingSalt   = { name = "Mending Salt", type = "Consumable", rarity = "Common", stackable = true, maxStack = 20, tradeable = true,
+	                  effect = { kind = "Heal", amount = 35 }, description = "Restores 35 health." },
+	ResetSigil    = { name = "Sigil of Unmaking", type = "Consumable", rarity = "Rare", stackable = true, maxStack = 5, tradeable = true,
+	                  effect = { kind = "ResetStats" }, description = "Refunds all allocated stat points." },
+
+	-- Accessories
+	CharmOfWard   = { name = "Charm of Ward", type = "Accessory", slot = "Charm", rarity = "Common", stackable = false, tradeable = true,
+	                  stats = { Vitality = 3 }, description = "+3 Vitality." },
+	KnucklebonesRing = { name = "Knucklebone Ring", type = "Accessory", slot = "Ring", rarity = "Uncommon", stackable = false, tradeable = true,
+	                  stats = { Strength = 4 }, description = "+4 Strength." },
+	InkwellPendant = { name = "Inkwell Pendant", type = "Accessory", slot = "Charm", rarity = "Rare", stackable = false, tradeable = true,
+	                  stats = { HexControl = 6 }, description = "+6 Hex Control." },
+	CrownShard    = { name = "Crown Shard", type = "Accessory", slot = "Ring", rarity = "Legendary", stackable = false, tradeable = true,
+	                  stats = { Strength = 6, Vitality = 4, HexControl = 4 }, description = "A splinter of a crown no one wears." },
+
+	-- Materials
+	CurseResidue  = { name = "Curse Residue", type = "Material", rarity = "Common", stackable = true, maxStack = 999, tradeable = true },
+	WardInk       = { name = "Ward Ink", type = "Material", rarity = "Uncommon", stackable = true, maxStack = 999, tradeable = true },
+	NestHeart     = { name = "Nest Heart", type = "Material", rarity = "Rare", stackable = true, maxStack = 99, tradeable = true },
+	BoundSeal     = { name = "Bound Seal", type = "Material", rarity = "Legendary", stackable = true, maxStack = 99, tradeable = false,
+	                  description = "Soulbound. Dropped by named curses." },
+}
+
+ItemData.EquipSlots = { "Charm", "Ring" }
+ItemData.MaxInventorySlots = 60
+
+return ItemData
