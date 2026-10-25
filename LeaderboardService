@@ -1,0 +1,107 @@
+-- LeaderboardService (ModuleScript, ServerScriptService)
+-- Global top-10 by Level using an OrderedDataStore, shown on a physical board in the world.
+--
+-- ASSUMPTIONS:
+--   * Level comes from ProgressionService:GetLevel(player) or data.Level.
+--   * Does NOT create leaderstats (your ProgressionService may already). Set CREATE_LEADERSTATS = true if not.
+--   * Board appears on a Part tagged "Leaderboard"; otherwise one is built near the first SpawnLocation.
+-- NOTE: Studio needs "Enable Studio Access to API Services" (Game Settings > Security) or this just logs a warning.
+
+local Players = game:GetService("Players")
+local DataStoreService = game:GetService("DataStoreService")
+local CollectionService = game:GetService("CollectionService")
+local Locator = require(script.Parent:WaitForChild("ServiceLocator"))
+
+local CREATE_LEADERSTATS = false
+local STORE_NAME = "HexLevelBoard_v1"
+local REFRESH = 120 -- seconds (DataStore budget friendly)
+
+local LeaderboardService = {}
+local store
+local boardRows = {}
+
+local function getLevel(player): number
+	local found, lv = Locator.Try("getLevel", { "ProgressionService.GetLevel" }, player)
+	if found and type(lv) == "number" then return lv end
+	local d = Locator.GetData(player)
+	return d and (d.Level or (d.Progression and d.Progression.Level)) or 1
+end
+
+local function buildBoard()
+	local part = CollectionService:GetTagged("Leaderboard")[1]
+	if not part then
+		local spawn = workspace:FindFirstChildWhichIsA("SpawnLocation", true)
+		local c = spawn and spawn.Position or Vector3.zero
+		part = Instance.new("Part")
+		part.Name = "LeaderboardBoard"
+		part.Size = Vector3.new(12, 14, 1)
+		part.Anchored = true
+		part.Material = Enum.Material.Slate
+		part.Color = Color3.fromRGB(20, 18, 28)
+		part.CFrame = CFrame.lookAt(c + Vector3.new(0, 7, -30), c + Vector3.new(0, 7, 0))
+		part.Parent = workspace
+	end
+	local sg = Instance.new("SurfaceGui")
+	sg.Face = Enum.NormalId.Front
+	sg.CanvasSize = Vector2.new(600, 700)
+	sg.Parent = part
+	local title = Instance.new("TextLabel")
+	title.Size = UDim2.new(1, 0, 0, 80); title.BackgroundTransparency = 1; title.Font = Enum.Font.GothamBold
+	title.TextScaled = true; title.TextColor3 = Color3.fromRGB(170, 90, 255); title.Text = "STRONGEST HEXBOUND"
+	title.Parent = sg
+	for i = 1, 10 do
+		local row = Instance.new("TextLabel")
+		row.Size = UDim2.new(1, -40, 0, 56); row.Position = UDim2.fromOffset(20, 90 + (i - 1) * 60)
+		row.BackgroundTransparency = 1; row.Font = Enum.Font.GothamMedium; row.TextScaled = true
+		row.TextXAlignment = Enum.TextXAlignment.Left
+		row.TextColor3 = i == 1 and Color3.fromRGB(255, 200, 60) or Color3.fromRGB(220, 215, 235)
+		row.Text = i .. ". —"
+		row.Parent = sg
+		boardRows[i] = row
+	end
+end
+
+local nameCache = {}
+local function nameOf(userId)
+	if nameCache[userId] then return nameCache[userId] end
+	local ok, n = pcall(Players.GetNameFromUserIdAsync, Players, userId)
+	nameCache[userId] = ok and n or ("User" .. userId)
+	return nameCache[userId]
+end
+
+local function refresh()
+	if not store then return end
+	for _, p in Players:GetPlayers() do
+		pcall(function() store:SetAsync(tostring(p.UserId), math.floor(getLevel(p))) end)
+	end
+	local ok, pages = pcall(function() return store:GetSortedAsync(false, 10) end)
+	if not ok then warn("[Leaderboard] read failed: " .. tostring(pages)) return end
+	for i, entry in pages:GetCurrentPage() do
+		if boardRows[i] then boardRows[i].Text = ("%d. %s  —  Lv %d"):format(i, nameOf(tonumber(entry.key)), entry.value) end
+	end
+end
+
+function LeaderboardService.Init()
+	local ok, s = pcall(function() return DataStoreService:GetOrderedDataStore(STORE_NAME) end)
+	if ok then store = s else warn("[Leaderboard] DataStore unavailable (enable API access in Studio): " .. tostring(s)) end
+end
+
+function LeaderboardService.Start()
+	buildBoard()
+	if CREATE_LEADERSTATS then
+		local function add(p)
+			local ls = Instance.new("Folder"); ls.Name = "leaderstats"; ls.Parent = p
+			local lv = Instance.new("IntValue"); lv.Name = "Level"; lv.Parent = ls
+			task.spawn(function() while p.Parent do lv.Value = getLevel(p); task.wait(5) end end)
+		end
+		Players.PlayerAdded:Connect(add)
+		for _, p in Players:GetPlayers() do add(p) end
+	end
+	task.spawn(function()
+		task.wait(10)
+		while true do refresh(); task.wait(REFRESH) end
+	end)
+	game:BindToClose(function() refresh() end)
+end
+
+return LeaderboardService
