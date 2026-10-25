@@ -1,0 +1,205 @@
+--!nonstrict
+--[[
+	PlayerDataService  (ServerScriptService/Services/PlayerDataService)
+	HEXBOUND - persistent player profiles saved with DataStoreService.
+
+	* Session lock: a profile is locked to one server (JobId) while loaded, which stops
+	  item duplication from joining two servers. A lock older than LOCK_EXPIRY is treated as stale.
+	* Saves automatically every AUTOSAVE_INTERVAL, on leave, and on server shutdown.
+	* Other services change data only through the returned profile table, then call MarkDirty.
+	  Trades call SaveNow on both parties straight after the swap.
+
+	API:
+		PlayerDataService:GetProfile(player) -> data | nil
+		PlayerDataService:WaitForProfile(player, timeout?) -> data | nil
+		PlayerDataService:SaveNow(player)
+		PlayerDataService.ProfileLoaded (signal: player, data)
+		PlayerDataService.ProfileReleasing (signal: player, data)
+]]
+
+local Players = game:GetService("Players")
+local DataStoreService = game:GetService("DataStoreService")
+local RunService = game:GetService("RunService")
+
+local STORE_NAME = "HexboundPlayer_v1"
+local AUTOSAVE_INTERVAL = 120
+local LOCK_EXPIRY = 600       -- seconds; covers servers that crashed without releasing the lock
+local MAX_RETRIES = 5
+
+local TEMPLATE = {
+	version = 1,
+	level = 1,
+	xp = 0,
+	statPoints = 0,
+	stats = { Vitality = 0, Strength = 0, HexControl = 0 },
+	lineage = "AshenScript",
+	spins = 5,
+	pity = { Legendary = 0, Mythic = 0 },
+	currency = { Marks = 0 },
+	inventory = {},            -- array of { uid, id, qty }
+	equipped = {},             -- [slot] = uid
+	missionsCompleted = 0,
+	stats_lifetime = { curseKills = 0, parries = 0 },
+	tradeCooldownUntil = 0,
+}
+
+local Signal = {}
+Signal.__index = Signal
+function Signal.new() return setmetatable({ _h = {} }, Signal) end
+function Signal:Connect(fn) table.insert(self._h, fn) end
+function Signal:Fire(...) for _, fn in ipairs(table.clone(self._h)) do task.spawn(fn, ...) end end
+
+local PlayerDataService = {}
+PlayerDataService.ProfileLoaded = Signal.new()
+PlayerDataService.ProfileReleasing = Signal.new()
+
+local store = nil
+local profiles = {} -- [Player] = { data, dirty }
+local useMemoryStore = false
+
+local function deepCopy(t)
+	local c = {}
+	for k, v in pairs(t) do c[k] = type(v) == "table" and deepCopy(v) or v end
+	return c
+end
+
+-- Fills in any fields missing from older saves (schema migration)
+local function reconcile(data, template)
+	for k, v in pairs(template) do
+		if data[k] == nil then
+			data[k] = type(v) == "table" and deepCopy(v) or v
+		elseif type(v) == "table" and type(data[k]) == "table" and #v == 0 and next(v) ~= nil then
+			reconcile(data[k], v)
+		end
+	end
+	return data
+end
+
+local function retry(fn)
+	for attempt = 1, MAX_RETRIES do
+		local ok, result = pcall(fn)
+		if ok then return true, result end
+		warn("[PlayerData] attempt", attempt, "failed:", result)
+		task.wait(math.min(2 ^ attempt, 10))
+	end
+	return false
+end
+
+local function keyFor(player) return "u_" .. player.UserId end
+
+local function load(player)
+	if useMemoryStore then return deepCopy(TEMPLATE) end
+	local lockedElsewhere = false
+	local ok, data = retry(function()
+		return store:UpdateAsync(keyFor(player), function(old)
+			old = old or deepCopy(TEMPLATE)
+			local lock = old._lock
+			if lock and lock.job ~= game.JobId and os.time() - lock.time < LOCK_EXPIRY then
+				lockedElsewhere = true
+				return nil -- don't write
+			end
+			old._lock = { job = game.JobId, time = os.time() }
+			return old
+		end)
+	end)
+	if not ok then return nil, "DataStoreError" end
+	if lockedElsewhere then return nil, "SessionLocked" end
+	return reconcile(data, TEMPLATE)
+end
+
+local function save(player, release: boolean)
+	local entry = profiles[player]
+	if not entry or useMemoryStore then return true end
+	local snapshot = deepCopy(entry.data)
+	return retry(function()
+		store:UpdateAsync(keyFor(player), function(old)
+			if old and old._lock and old._lock.job ~= game.JobId then
+				return nil -- another server holds the lock; never overwrite its data
+			end
+			snapshot._lock = (not release) and { job = game.JobId, time = os.time() } or nil
+			return snapshot
+		end)
+	end)
+end
+
+----------------------------------------------------------------------
+function PlayerDataService:GetProfile(player)
+	local e = profiles[player]
+	return e and e.data
+end
+
+function PlayerDataService:WaitForProfile(player, timeout)
+	local deadline = os.clock() + (timeout or 30)
+	while player.Parent and not profiles[player] and os.clock() < deadline do task.wait(0.1) end
+	return self:GetProfile(player)
+end
+
+function PlayerDataService:MarkDirty(player)
+	local e = profiles[player]
+	if e then e.dirty = true end
+end
+
+function PlayerDataService:SaveNow(player)
+	local e = profiles[player]
+	if not e then return false end
+	local ok = save(player, false)
+	if ok then e.dirty = false end
+	return ok
+end
+
+----------------------------------------------------------------------
+local function onPlayerAdded(player)
+	local data, err = load(player)
+	if not player.Parent then return end
+	if not data then
+		local msg = err == "SessionLocked"
+			and "Your data is still in use by another server. Please rejoin in a moment."
+			or "Couldn't load your data. Please rejoin."
+		player:Kick(msg)
+		return
+	end
+	profiles[player] = { data = data, dirty = false }
+	PlayerDataService.ProfileLoaded:Fire(player, data)
+end
+
+local function onPlayerRemoving(player)
+	local e = profiles[player]
+	if not e then return end
+	PlayerDataService.ProfileReleasing:Fire(player, e.data)
+	save(player, true)
+	profiles[player] = nil
+end
+
+function PlayerDataService:Init()
+	local ok = pcall(function() store = DataStoreService:GetDataStore(STORE_NAME) end)
+	if not ok or (RunService:IsStudio() and not pcall(function() store:GetAsync("_probe") end)) then
+		-- Studio without API access: use a non-persistent in-memory profile so testing still works
+		warn("[PlayerData] DataStore unavailable - using in-memory profiles (nothing will be saved)")
+		useMemoryStore = true
+	end
+
+	Players.PlayerAdded:Connect(onPlayerAdded)
+	Players.PlayerRemoving:Connect(onPlayerRemoving)
+	for _, p in ipairs(Players:GetPlayers()) do task.spawn(onPlayerAdded, p) end
+
+	task.spawn(function()
+		while true do
+			task.wait(AUTOSAVE_INTERVAL)
+			for player, e in pairs(profiles) do
+				if e.dirty then task.spawn(function() if save(player, false) then e.dirty = false end end) end
+			end
+		end
+	end)
+
+	game:BindToClose(function()
+		local pending = 0
+		for player in pairs(profiles) do
+			pending += 1
+			task.spawn(function() save(player, true); pending -= 1 end)
+		end
+		local deadline = os.clock() + 25
+		while pending > 0 and os.clock() < deadline do task.wait(0.1) end
+	end)
+end
+
+return PlayerDataService
