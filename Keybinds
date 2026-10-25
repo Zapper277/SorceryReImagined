@@ -1,0 +1,64 @@
+-- Keybinds (ModuleScript, ReplicatedStorage)
+-- Single source for remappable keys. SettingsController saves player choices and publishes them as
+-- LocalPlayer attributes "Setting_Key_<Action>"; Keybinds.Get() reads those, else the default.
+--
+-- UI panels already use this automatically (UIKit.BindToggle looks up the action from its default key).
+-- COMBAT: the Combat* actions are listed so they show in the remap menu, BUT your CombatController must
+--   read them to take effect, e.g. replace `input.KeyCode == Enum.KeyCode.Q` with `Keybinds.Is(input, "Dash")`.
+--   ASSUMPTION: the default combat keys below are guesses - change them to what CombatController uses.
+
+local Players = game:GetService("Players")
+
+local Keybinds = {}
+
+Keybinds.Order = { "Inventory", "Missions", "Lineage", "Trade", "Party", "Settings", "Dash", "Block", "Technique1", "Technique2", "Technique3", "Domain" }
+
+Keybinds.Defaults = {
+	Inventory = Enum.KeyCode.I,
+	Missions = Enum.KeyCode.J,
+	Lineage = Enum.KeyCode.L,
+	Trade = Enum.KeyCode.T,
+	Party = Enum.KeyCode.P,
+	Settings = Enum.KeyCode.K,
+	-- Combat (only work once CombatController reads them)
+	Dash = Enum.KeyCode.Q,
+	Block = Enum.KeyCode.F,
+	Technique1 = Enum.KeyCode.Z,
+	Technique2 = Enum.KeyCode.X,
+	Technique3 = Enum.KeyCode.C,
+	Domain = Enum.KeyCode.G,
+}
+
+-- Keys that can never be bound (chat, menu, movement)
+Keybinds.Reserved = {
+	[Enum.KeyCode.Slash] = true, [Enum.KeyCode.Escape] = true, [Enum.KeyCode.Return] = true,
+	[Enum.KeyCode.W] = true, [Enum.KeyCode.A] = true, [Enum.KeyCode.S] = true, [Enum.KeyCode.D] = true,
+	[Enum.KeyCode.Space] = true, [Enum.KeyCode.Tab] = true, [Enum.KeyCode.Backquote] = true,
+}
+
+function Keybinds.Get(action: string): Enum.KeyCode?
+	local lp = Players.LocalPlayer
+	local name = lp and lp:GetAttribute("Setting_Key_" .. action)
+	if type(name) == "string" then
+		local ok, kc = pcall(function() return Enum.KeyCode[name] end)
+		if ok and kc then return kc end
+	end
+	return Keybinds.Defaults[action]
+end
+
+function Keybinds.Is(input: InputObject, action: string): boolean
+	return input.KeyCode ~= Enum.KeyCode.Unknown and input.KeyCode == Keybinds.Get(action)
+end
+
+function Keybinds.ActionForDefault(keyCode: Enum.KeyCode): string?
+	for action, kc in Keybinds.Defaults do if kc == keyCode then return action end end
+	return nil
+end
+
+-- Returns the action currently bound to keyCode (for conflict warnings), if any
+function Keybinds.ActionUsing(keyCode: Enum.KeyCode): string?
+	for _, action in Keybinds.Order do if Keybinds.Get(action) == keyCode then return action end end
+	return nil
+end
+
+return Keybinds
