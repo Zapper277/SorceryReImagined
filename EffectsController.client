@@ -1,0 +1,106 @@
+-- EffectsController (LocalScript, StarterPlayerScripts)
+-- Plays greybox VFX (VFXData) and sounds (SoundData) when the server asks, and shows Notify toasts.
+-- Server side: ClientBridgeService.PlayVFX("HitSpark", cframe) / .PlaySound("Hit", position) / .Notify(player, text)
+-- Client side (e.g. from CombatController for instant feedback): require this pattern via the
+--   _G.HexFX table exposed at the bottom (ASSUMPTION: _G is acceptable for a quick shared hook;
+--   swap to a ModuleScript if your CombatController prefers).
+-- NEEDS ART/AUDIO: VFXData + SoundData are placeholders.
+
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+local SoundService = game:GetService("SoundService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Remotes = require(ReplicatedStorage:WaitForChild("Remotes"))
+local UIKit = require(ReplicatedStorage:WaitForChild("UIKit"))
+local VFXData = require(ReplicatedStorage:WaitForChild("VFXData"))
+local SoundData = require(ReplicatedStorage:WaitForChild("SoundData"))
+
+local MAX_ACTIVE_VFX = 80
+local activeCount = 0
+
+local fxFolder = Instance.new("Folder")
+fxFolder.Name = "ClientFX"
+fxFolder.Parent = workspace
+
+local function makePart(def, cf, scale)
+	local p = Instance.new("Part")
+	p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch, p.CastShadow = true, false, false, false, false
+	p.Material = Enum.Material.Neon
+	p.Color = def.Color
+	local s = def.Size * scale
+	if def.Shape == "Sphere" or def.Shape == "Burst" then
+		p.Shape = Enum.PartType.Ball
+		p.Size = Vector3.one * s
+	elseif def.Shape == "Ring" then
+		p.Shape = Enum.PartType.Cylinder
+		p.Size = Vector3.new(0.2, s, s)
+		cf = cf * CFrame.Angles(0, 0, math.rad(90)) -- flat on ground
+	else -- Beam
+		p.Size = Vector3.new(0.4, 0.4, s)
+	end
+	p.CFrame = cf
+	p.Parent = fxFolder
+	return p
+end
+
+local function playVFX(key: string, cf: CFrame, scale: number?)
+	local def = VFXData[key]
+	if not def or typeof(cf) ~= "CFrame" or activeCount >= MAX_ACTIVE_VFX then return end
+	scale = scale or 1
+	activeCount += 1
+	local p = makePart(def, cf, scale)
+	local endSize = p.Size * def.Grow
+	if def.Shape == "Ring" then endSize = Vector3.new(p.Size.X, p.Size.Y * def.Grow, p.Size.Z * def.Grow) end
+	TweenService:Create(p, TweenInfo.new(def.Duration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Size = endSize, Transparency = 1 }):Play()
+	if def.Shape == "Burst" then
+		-- a few shards for "burst"
+		for _ = 1, 5 do
+			local shard = Instance.new("Part")
+			shard.Anchored, shard.CanCollide, shard.CanQuery, shard.CanTouch, shard.CastShadow = true, false, false, false, false
+			shard.Material = Enum.Material.Neon; shard.Color = def.Color
+			shard.Size = Vector3.new(0.15, 0.15, 0.8) * scale
+			shard.CFrame = cf * CFrame.Angles(math.random() * 6.28, math.random() * 6.28, 0)
+			shard.Parent = fxFolder
+			TweenService:Create(shard, TweenInfo.new(def.Duration), { CFrame = shard.CFrame * CFrame.new(0, 0, -def.Size * scale), Transparency = 1 }):Play()
+			Debris:AddItem(shard, def.Duration + 0.05)
+		end
+	end
+	task.delay(def.Duration + 0.05, function() p:Destroy(); activeCount -= 1 end)
+end
+
+local function playSound(key: string, position: Vector3?)
+	local def = SoundData[key]
+	if not def or def.Id == "rbxassetid://0" then return end
+	local s = Instance.new("Sound")
+	s.SoundId = def.Id
+	local master = game:GetService("Players").LocalPlayer:GetAttribute("Setting_MasterVolume")
+	s.Volume = (def.Volume or 1) * (type(master) == "number" and master or 1)
+	s.PlaybackSpeed = 1 + (math.random() * 2 - 1) * (def.PitchVariance or 0)
+	if typeof(position) == "Vector3" then
+		local att = Instance.new("Attachment")
+		att.WorldPosition = position
+		att.Parent = workspace.Terrain
+		s.Parent = att
+		s.RollOffMaxDistance = 200
+		s.Ended:Connect(function() att:Destroy() end)
+		Debris:AddItem(att, 10)
+	else
+		s.Parent = SoundService
+		s.Ended:Connect(function() s:Destroy() end)
+		Debris:AddItem(s, 10)
+	end
+	s:Play()
+end
+
+Remotes.Event("PlayVFX").OnClientEvent:Connect(playVFX)
+Remotes.Event("PlaySound").OnClientEvent:Connect(playSound)
+
+local KIND_COLORS = { Good = UIKit.Theme.Good, Bad = UIKit.Theme.Bad }
+Remotes.Event("Notify").OnClientEvent:Connect(function(text, kind)
+	if type(text) ~= "string" then return end
+	UIKit.Toast(text, KIND_COLORS[kind])
+	playSound("Notify")
+end)
+
+-- Local hook so CombatController/HUDController can do instant client-predicted effects
+_G.HexFX = { PlayVFX = playVFX, PlaySound = playSound }
