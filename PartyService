@@ -1,0 +1,140 @@
+-- PartyService (ModuleScript, ServerScriptService)
+-- Session-only parties (fills the "no persistent parties" gap for a single server).
+-- Parties do NOT survive leaving the server - that still needs MemoryStore + TeleportService later.
+--
+-- Public API for your other services:
+--   PartyService.GetParty(player) -> party table or nil
+--   PartyService.GetMembers(player) -> { Player } (just {player} if solo)
+--   PartyService.AreAllies(a, b) -> boolean   (use in CombatService to block friendly fire)
+--   PartyService.PartyChanged : BindableEvent (fires (party) on any change)
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Remotes = require(ReplicatedStorage:WaitForChild("Remotes"))
+
+local MAX_SIZE = 4
+local INVITE_TTL = 30
+
+local PartyService = {}
+PartyService.PartyChanged = Instance.new("BindableEvent")
+
+local nextId = 0
+local partyOf: { [Player]: any } = {}
+local invites: { [Player]: { [Player]: number } } = {} -- invitee -> { inviter = expiresAt }
+
+local function notify(p, text, kind) Remotes.Event("Notify"):FireClient(p, text, kind) end
+
+local function sync(party)
+	if not party then return end
+	local payload = { Id = party.Id, Leader = party.Leader, Members = party.Members }
+	for _, m in party.Members do Remotes.Event("PartySync"):FireClient(m, payload) end
+	PartyService.PartyChanged:Fire(party)
+end
+
+local function create(leader)
+	nextId += 1
+	local party = { Id = nextId, Leader = leader, Members = { leader } }
+	partyOf[leader] = party
+	return party
+end
+
+local function removeMember(player, reason)
+	local party = partyOf[player]
+	if not party then return end
+	partyOf[player] = nil
+	local i = table.find(party.Members, player)
+	if i then table.remove(party.Members, i) end
+	if player.Parent then
+		Remotes.Event("PartySync"):FireClient(player, nil)
+		if reason then notify(player, reason) end
+	end
+	if #party.Members <= 1 then
+		-- disband
+		for _, m in party.Members do partyOf[m] = nil; Remotes.Event("PartySync"):FireClient(m, nil); notify(m, "Party disbanded.") end
+		party.Members = {}
+		PartyService.PartyChanged:Fire(party)
+		return
+	end
+	if party.Leader == player then party.Leader = party.Members[1]; notify(party.Leader, "You are now party leader.") end
+	sync(party)
+end
+
+function PartyService.GetParty(player) return partyOf[player] end
+function PartyService.GetMembers(player)
+	local p = partyOf[player]; return p and table.clone(p.Members) or { player }
+end
+function PartyService.AreAllies(a, b)
+	if a == b then return true end
+	local p = partyOf[a]; return p ~= nil and p == partyOf[b]
+end
+
+function PartyService.Invite(from: Player, to: Player)
+	if from == to or not to.Parent then return false end
+	local party = partyOf[from]
+	if party and party.Leader ~= from then notify(from, "Only the leader can invite.", "Bad") return false end
+	if party and #party.Members >= MAX_SIZE then notify(from, "Party is full.", "Bad") return false end
+	if partyOf[to] then notify(from, to.DisplayName .. " is already in a party.", "Bad") return false end
+	invites[to] = invites[to] or {}
+	invites[to][from] = os.clock() + INVITE_TTL
+	Remotes.Event("PartyInvite"):FireClient(to, from)
+	notify(from, "Invited " .. to.DisplayName .. ".")
+	return true
+end
+
+function PartyService.Accept(player: Player, inviter: Player)
+	local inv = invites[player]
+	local exp = inv and inv[inviter]
+	if not exp or os.clock() > exp then notify(player, "Invite expired.", "Bad") return false end
+	inv[inviter] = nil
+	if partyOf[player] then return false end
+	local party = partyOf[inviter] or create(inviter)
+	if party.Leader ~= inviter or #party.Members >= MAX_SIZE then notify(player, "Can't join that party.", "Bad") return false end
+	table.insert(party.Members, player)
+	partyOf[player] = party
+	for _, m in party.Members do if m ~= player then notify(m, player.DisplayName .. " joined the party.", "Good") end end
+	sync(party)
+	return true
+end
+
+function PartyService.Leave(player) removeMember(player, "You left the party.") end
+
+function PartyService.Kick(leader, target)
+	local party = partyOf[leader]
+	if not party or party.Leader ~= leader or partyOf[target] ~= party or target == leader then return false end
+	removeMember(target, "You were removed from the party.")
+	return true
+end
+
+function PartyService.Promote(leader, target)
+	local party = partyOf[leader]
+	if not party or party.Leader ~= leader or partyOf[target] ~= party then return false end
+	party.Leader = target
+	sync(party)
+	return true
+end
+
+function PartyService.Init() end
+
+function PartyService.Start()
+	Remotes.Event("PartyAction").OnServerEvent:Connect(function(player, action, target)
+		if not Remotes.RateLimit(player, "party", 3, 5) then return end
+		local tp = typeof(target) == "Instance" and target:IsA("Player") and target or nil
+		if action == "Invite" and tp then PartyService.Invite(player, tp)
+		elseif action == "Accept" and tp then PartyService.Accept(player, tp)
+		elseif action == "Decline" and tp then
+			if invites[player] then invites[player][tp] = nil end
+			notify(tp, player.DisplayName .. " declined your invite.")
+		elseif action == "Leave" then PartyService.Leave(player)
+		elseif action == "Kick" and tp then PartyService.Kick(player, tp)
+		elseif action == "Promote" and tp then PartyService.Promote(player, tp)
+		end
+	end)
+
+	Players.PlayerRemoving:Connect(function(p)
+		removeMember(p, nil)
+		invites[p] = nil
+		for _, inv in invites do inv[p] = nil end
+	end)
+end
+
+return PartyService
