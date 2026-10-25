@@ -1,0 +1,375 @@
+--!nonstrict
+--[[
+	CurseAI  (ServerScriptService/Services/CurseAI)
+	HEXBOUND - spawns curse NPCs and runs their behaviour on the server. Curses use exactly the same
+	CombatService / TechniqueRegistry rules as players (they can be parried, guard-broken, etc.).
+
+	CurseAI:Spawn(curseId, position, opts) -> model
+	  opts.getTargets : function() -> { Model } - candidate targets (players, ward, civilian)
+	  opts.preferObjective : Model? - target this when no player is within `objectiveLeash` studs
+	  opts.parent : Instance
+	  opts.onPhase : function(phaseIndex)  (bosses)
+	CurseAI:Despawn(model)
+
+	The behaviour is a simple utility loop, run every TICK seconds:
+	  1. Pick the nearest valid target within aggroRange.
+	  2. If it's a player who is starting an attack, there's a chance to block (blockChance) for a short time.
+	  3. If a technique is off cooldown and fits the distance, use it (projectiles at range, bursts close up).
+	  4. Otherwise close the distance and M1 when in attackRange.
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+local PathfindingService = game:GetService("PathfindingService")
+
+local MissionData = require(ReplicatedStorage.Shared.MissionData)
+local TechniqueData = require(ReplicatedStorage.Shared.TechniqueData)
+local Services = ServerScriptService.Services
+local CombatService = require(Services.CombatService)
+local TechniqueRegistry = require(Services.TechniqueRegistry)
+
+local TICK = 0.15
+local OBJECTIVE_LEASH = 18 -- go for a nearby player over the objective only if they're this close
+
+local CurseAI = {}
+local active = {} -- [Model] = brain
+local rng = Random.new()
+
+local function buildRig(def)
+	local desc = Instance.new("HumanoidDescription")
+	desc.HeadColor, desc.TorsoColor = def.color, def.color
+	desc.LeftArmColor, desc.RightArmColor = def.color, def.color
+	desc.LeftLegColor, desc.RightLegColor = def.color, def.color
+	desc.HeightScale, desc.WidthScale, desc.DepthScale, desc.HeadScale = def.scale, def.scale, def.scale, def.scale
+	local model = Players:CreateHumanoidModelFromDescription(desc, Enum.HumanoidRigType.R15)
+	-- Glowing eyes so curses read as enemies in a dark map
+	local head = model:FindFirstChild("Head")
+	if head then
+		local face = head:FindFirstChildOfClass("Decal")
+		if face then face:Destroy() end
+		for _, x in ipairs({ -0.25, 0.25 }) do
+			local eye = Instance.new("Part")
+			eye.Size = Vector3.new(0.18, 0.12, 0.05) * def.scale
+			eye.Material = Enum.Material.Neon
+			eye.Color = Color3.fromRGB(255, 40, 40)
+			eye.CanCollide = false
+			eye.Massless = true
+			eye.CFrame = head.CFrame * CFrame.new(x * def.scale, 0.1 * def.scale, -0.6 * def.scale)
+			local w = Instance.new("WeldConstraint")
+			w.Part0, w.Part1 = head, eye
+			w.Parent = eye
+			eye.Parent = model
+		end
+	end
+	return model
+end
+
+local function hrp(model) return model and model:FindFirstChild("HumanoidRootPart") end
+
+local function alive(model)
+	local h = model and model:FindFirstChildOfClass("Humanoid")
+	return h and h.Health > 0 and hrp(model) ~= nil
+end
+
+local function pickTarget(brain)
+	local root = hrp(brain.model)
+	if not root then return nil end
+	local best, bestDist = nil, brain.def.aggroRange
+	for _, m in ipairs(brain.getTargets()) do
+		if alive(m) and m ~= brain.preferObjective then
+			local d = (hrp(m).Position - root.Position).Magnitude
+			if d < bestDist then best, bestDist = m, d end
+		end
+	end
+	local obj = brain.preferObjective
+	if obj and alive(obj) and (not best or bestDist > OBJECTIVE_LEASH) then
+		return obj, (hrp(obj).Position - root.Position).Magnitude
+	end
+	return best, bestDist
+end
+
+local function face(root, pos)
+	local flat = Vector3.new(pos.X, root.Position.Y, pos.Z)
+	if (flat - root.Position).Magnitude > 0.1 then
+		root.CFrame = CFrame.lookAt(root.Position, flat)
+	end
+end
+
+----------------------------------------------------------------------
+-- Navigation
+--   * Clear line of sight and close: walk straight at the target (most responsive).
+--   * Otherwise follow a PathfindingService path. The path is recomputed when the goal has moved
+--     REPATH_DISTANCE, when it is REPATH_INTERVAL old, or when we look stuck.
+--   * If path computation fails, fall back to walking straight (better than standing still).
+----------------------------------------------------------------------
+local DIRECT_RANGE = 24
+local REPATH_DISTANCE = 6
+local REPATH_INTERVAL = 1.5
+local STUCK_TIME = 1.2
+local WAYPOINT_REACHED = 3
+
+local function hasLineOfSight(brain, from: Vector3, to: Vector3)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local exclude = { brain.model }
+	-- Ignore characters, so only level geometry blocks sight
+	for _, p in ipairs(Players:GetPlayers()) do if p.Character then table.insert(exclude, p.Character) end end
+	params.FilterDescendantsInstances = exclude
+	local result = workspace:Raycast(from, to - from, params)
+	return result == nil or (result.Instance:FindFirstAncestorOfClass("Model") and
+		result.Instance:FindFirstAncestorOfClass("Model"):FindFirstChildOfClass("Humanoid") ~= nil)
+end
+
+local function computePath(brain, from: Vector3, goal: Vector3)
+	local nav = brain.nav
+	nav.computedAt = os.clock()
+	nav.goal = goal
+	local ok = pcall(function() nav.path:ComputeAsync(from, goal) end)
+	if ok and nav.path.Status == Enum.PathStatus.Success then
+		nav.waypoints = nav.path:GetWaypoints()
+		nav.index = 2 -- waypoint 1 is our own position
+	else
+		nav.waypoints = nil
+	end
+end
+
+local function moveToward(brain, hum: Humanoid, root: BasePart, goal: Vector3)
+	local nav = brain.nav
+	local now = os.clock()
+
+	-- Stuck detection: barely moved since the last check while we were trying to move
+	if now - nav.lastProgressAt > STUCK_TIME then
+		if (root.Position - nav.lastProgressPos).Magnitude < 1.5 then
+			nav.waypoints = nil
+			nav.computedAt = 0
+			hum.Jump = true
+		end
+		nav.lastProgressAt, nav.lastProgressPos = now, root.Position
+	end
+
+	local dist = (goal - root.Position).Magnitude
+	if dist < DIRECT_RANGE and hasLineOfSight(brain, root.Position, goal) then
+		nav.waypoints = nil
+		hum:MoveTo(goal)
+		return
+	end
+
+	if not nav.waypoints or now - nav.computedAt > REPATH_INTERVAL
+		or (nav.goal and (nav.goal - goal).Magnitude > REPATH_DISTANCE) then
+		computePath(brain, root.Position, goal)
+	end
+
+	local wps = nav.waypoints
+	if not wps then
+		hum:MoveTo(goal) -- fallback
+		return
+	end
+	local wp = wps[nav.index]
+	while wp and (Vector3.new(wp.Position.X, root.Position.Y, wp.Position.Z) - root.Position).Magnitude < WAYPOINT_REACHED do
+		nav.index += 1
+		wp = wps[nav.index]
+	end
+	if not wp then
+		nav.waypoints = nil
+		hum:MoveTo(goal)
+		return
+	end
+	if wp.Action == Enum.PathWaypointAction.Jump then hum.Jump = true end
+	hum:MoveTo(wp.Position)
+end
+
+local function tryTechnique(brain, target, dist)
+	local now = os.clock()
+	if now < brain.nextTechAt then return false end
+	for _, id in ipairs(brain.def.techniques) do
+		local t = TechniqueData.Techniques[id]
+		local fits = (t.kind == "Projectile" and dist > 12 and dist < t.projectile.range * 0.8)
+			or (t.kind == "Burst" and dist < t.hitbox.size.X * 0.45)
+			or (t.kind == "Melee" and dist < (t.hitbox.offset + t.hitbox.size.Z / 2))
+		if fits and rng:NextNumber() < 0.35 then
+			local root = hrp(brain.model)
+			local aim = (hrp(target).Position - root.Position)
+			face(root, hrp(target).Position)
+			if TechniqueRegistry:Cast(brain.model, id, aim.Magnitude > 0 and aim.Unit or nil) then
+				brain.nextTechAt = now + rng:NextNumber(2.5, 5)
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function step(brain)
+	local model, def = brain.model, brain.def
+	local hum = model:FindFirstChildOfClass("Humanoid")
+	local root = hrp(model)
+	if not hum or not root or hum.Health <= 0 then return false end
+
+	-- Boss phases
+	if def.phases then
+		local frac = hum.Health / hum.MaxHealth
+		local nextPhase = def.phases[brain.phase + 1]
+		if nextPhase and frac <= nextPhase.atHealth then
+			brain.phase += 1
+			model:SetAttribute("DamageMult", nextPhase.damageMult)
+			brain.walkSpeed = nextPhase.walkSpeed
+			model:SetAttribute("BossPhase", brain.phase)
+			if brain.onPhase then task.spawn(brain.onPhase, brain.phase) end
+		end
+	end
+
+	local state = CombatService:GetState(model)
+	if state ~= "Idle" and state ~= "Blocking" then return true end -- busy or stunned
+	-- Hitstun etc. change WalkSpeed; restore ours whenever we're free to act
+	hum.WalkSpeed = brain.walkSpeed
+
+	local target, dist = pickTarget(brain)
+	if not target then
+		if state == "Blocking" then CombatService:SetBlocking(model, false) end
+		hum:MoveTo(root.Position)
+		return true
+	end
+	local tPos = hrp(target).Position
+
+	-- Defensive: react to an incoming M1 or technique
+	local tState = target:GetAttribute("CombatState")
+	if state == "Blocking" then
+		if os.clock() >= brain.blockUntil then CombatService:SetBlocking(model, false) end
+		face(root, tPos)
+		return true
+	end
+	if dist < 10 and (tState == "M1Startup" or tState == "TechStartup") and rng:NextNumber() < def.blockChance then
+		face(root, tPos)
+		CombatService:SetBlocking(model, true)
+		brain.blockUntil = os.clock() + rng:NextNumber(0.35, 0.8)
+		return true
+	end
+
+	if tryTechnique(brain, target, dist) then return true end
+
+	if dist > def.attackRange then
+		moveToward(brain, hum, root, tPos)
+	else
+		hum:MoveTo(root.Position)
+		-- Standing still on purpose: don't let stuck detection count this time
+		brain.nav.lastProgressAt, brain.nav.lastProgressPos = os.clock(), root.Position
+		face(root, tPos)
+		CombatService:RequestM1(model)
+	end
+	return true
+end
+
+function CurseAI:Spawn(curseId: string, position: Vector3, opts)
+	local def = MissionData.Curses[curseId]
+	assert(def and not def.structure, "Not a walking curse: " .. tostring(curseId))
+	opts = opts or {}
+
+	local model = buildRig(def)
+	model.Name = def.name
+	local hum = model:FindFirstChildOfClass("Humanoid")
+	hum.MaxHealth = def.health
+	hum.Health = def.health
+	hum.WalkSpeed = def.walkSpeed
+	hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.Viewer
+	hum.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOn
+	model:SetAttribute("Faction", "Curse")
+	model:SetAttribute("CurseId", curseId)
+	model:SetAttribute("DamageMult", def.damageMult)
+	if def.boss then model:SetAttribute("Boss", true) end
+	model:PivotTo(CFrame.new(position + Vector3.new(0, 3 * def.scale, 0)))
+	model.Parent = opts.parent or workspace
+	hrp(model):SetNetworkOwner(nil) -- the server simulates curses
+
+	CombatService:RegisterEntity(model)
+
+	local brain = {
+		model = model, def = def, phase = 0, walkSpeed = def.walkSpeed,
+		nav = {
+			path = PathfindingService:CreatePath({
+				AgentRadius = 2 * def.scale, AgentHeight = 5 * def.scale,
+				AgentCanJump = true, WaypointSpacing = 6,
+			}),
+			waypoints = nil, index = 1, computedAt = 0, goal = nil,
+			lastProgressAt = os.clock(), lastProgressPos = position,
+		},
+		getTargets = opts.getTargets or function()
+			local list = {}
+			for _, p in ipairs(Players:GetPlayers()) do if p.Character then table.insert(list, p.Character) end end
+			return list
+		end,
+		preferObjective = opts.preferObjective,
+		onPhase = opts.onPhase,
+		nextTechAt = os.clock() + rng:NextNumber(1, 3),
+		blockUntil = 0,
+	}
+	active[model] = brain
+
+	task.spawn(function()
+		task.wait(rng:NextNumber(0, TICK)) -- stagger ticks so curses don't all update on the same frame
+		while active[model] == brain and step(brain) do
+			task.wait(TICK)
+		end
+		active[model] = nil
+	end)
+
+	hum.Died:Connect(function()
+		active[model] = nil
+		task.delay(3, function() if model.Parent then model:Destroy() end end)
+	end)
+	return model
+end
+
+function CurseAI:Despawn(model)
+	active[model] = nil
+	if model and model.Parent then model:Destroy() end
+end
+
+--[[
+	Builds a stationary damageable structure (Curse Nest, Ward Stone). It counts as a combat entity
+	(it has a Humanoid and a HumanoidRootPart) so normal hits damage it. Anchored, so knockback has no effect.
+]]
+function CurseAI:SpawnStructure(name: string, position: Vector3, health: number, faction: string, opts)
+	opts = opts or {}
+	local model = Instance.new("Model")
+	model.Name = name
+	local root = Instance.new("Part")
+	root.Name = "HumanoidRootPart"
+	root.Anchored = true
+	root.Size = opts.size or Vector3.new(6, 8, 6)
+	root.Material = opts.material or Enum.Material.Neon
+	root.Color = opts.color or Color3.fromRGB(120, 20, 40)
+	root.Transparency = opts.transparency or 0
+	root.CFrame = CFrame.new(position + Vector3.new(0, root.Size.Y / 2, 0))
+	root.Parent = model
+	local hum = Instance.new("Humanoid")
+	hum.MaxHealth = health
+	hum.Health = health
+	hum.WalkSpeed = 0
+	hum.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOn
+	hum.Parent = model
+	model.PrimaryPart = root
+	model:SetAttribute("Faction", faction)
+	model:SetAttribute("Structure", true)
+	model.Parent = opts.parent or workspace
+	CombatService:RegisterEntity(model)
+	return model
+end
+
+function CurseAI:Spawn_Civilian(position: Vector3, health: number, parent)
+	local desc = Instance.new("HumanoidDescription")
+	local model = Players:CreateHumanoidModelFromDescription(desc, Enum.HumanoidRigType.R15)
+	model.Name = "Civilian"
+	local hum = model:FindFirstChildOfClass("Humanoid")
+	hum.MaxHealth, hum.Health = health, health
+	hum.WalkSpeed = 12
+	hum.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOn
+	model:SetAttribute("Faction", "Sorcerer")
+	model:PivotTo(CFrame.new(position + Vector3.new(0, 3, 0)))
+	model.Parent = parent or workspace
+	hrp(model):SetNetworkOwner(nil)
+	CombatService:RegisterEntity(model)
+	return model
+end
+
+return CurseAI
