@@ -1,0 +1,150 @@
+--!nonstrict
+--[[
+	RollService  (ServerScriptService/Services/RollService)
+	HEXBOUND - every random roll for rewards happens on the server: Lineage spins and loot drops.
+
+	Lineage roll:
+	  1. Costs 1 spin (profile.spins). Rejected while in a mission or trade.
+	  2. Picks a rarity by weight, then hard pity can raise it (see LineageData.Pity).
+	  3. Picks a uniformly random Lineage within that rarity, never your current one, so a roll always changes something.
+	  4. Updates pity counters, applies through ProgressionService, saves.
+	  The client receives the result to play the reveal animation. It only displays the result and has no say in it.
+
+	Remote RollRequest: ("Lineage")
+	Remote RollResult (S->C): (lineageId, rarityId, spinsLeft, pityTable)
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local LineageData = require(ReplicatedStorage.Shared.LineageData)
+local Services = ServerScriptService.Services
+local PlayerDataService = require(Services.PlayerDataService)
+local ProgressionService = require(Services.ProgressionService)
+
+local Remotes = ReplicatedStorage.Remotes
+local function remote(name)
+	local r = Remotes:FindFirstChild(name) or Instance.new("RemoteEvent")
+	r.Name = name
+	r.Parent = Remotes
+	return r
+end
+local RollRequest = remote("RollRequest")
+local RollResult = remote("RollResult")
+
+local RollService = {}
+local rng = Random.new()
+local busy = {}         -- [Player] = true while a roll is being processed
+local lastRoll = {}
+local ROLL_COOLDOWN = 1.0 -- seconds; leaves time for the reveal animation and blocks spam
+
+-- Hooks that other services set to block rolling (MissionService / TradeService)
+RollService.BlockChecks = {}
+
+----------------------------------------------------------------------
+-- Generic weighted pick: list of { weight = n, ... } -> entry
+----------------------------------------------------------------------
+function RollService:PickWeighted(list, random)
+	random = random or rng
+	local total = 0
+	for _, e in ipairs(list) do total += e.weight end
+	if total <= 0 then return nil end
+	local r = random:NextNumber() * total
+	for _, e in ipairs(list) do
+		r -= e.weight
+		if r <= 0 then return e end
+	end
+	return list[#list]
+end
+
+function RollService:RollDrops(tableName: string, count: number, dropTables)
+	local list = dropTables[tableName]
+	local out = {}
+	if not list then return out end
+	for _ = 1, count do
+		local e = self:PickWeighted(list)
+		if e then
+			table.insert(out, { item = e.item, qty = rng:NextInteger(e.min, e.max) })
+		end
+	end
+	return out
+end
+
+----------------------------------------------------------------------
+-- Lineage roll
+----------------------------------------------------------------------
+local function rollRarity(pity)
+	local picked = RollService:PickWeighted(LineageData.Rarities).id
+	local idx = LineageData.rarityIndex(picked)
+	-- Hard pity: check the highest tier first
+	if (pity.Mythic or 0) + 1 >= LineageData.Pity.Mythic then
+		return "Mythic"
+	end
+	if (pity.Legendary or 0) + 1 >= LineageData.Pity.Legendary and idx < LineageData.rarityIndex("Legendary") then
+		return "Legendary"
+	end
+	return picked
+end
+
+function RollService:RollLineage(player)
+	local data = PlayerDataService:GetProfile(player)
+	if not data then return nil, "NoProfile" end
+	if data.spins <= 0 then return nil, "NoSpins" end
+	for _, check in ipairs(self.BlockChecks) do
+		local blocked, reason = check(player)
+		if blocked then return nil, reason end
+	end
+
+	local rarity = rollRarity(data.pity)
+	local pool = LineageData.byRarity(rarity)
+	-- Never roll the Lineage you already have, as long as the tier has other options
+	if #pool > 1 then
+		local filtered = {}
+		for _, id in ipairs(pool) do if id ~= data.lineage then table.insert(filtered, id) end end
+		pool = filtered
+	end
+	local lineageId = pool[rng:NextInteger(1, #pool)]
+
+	data.spins -= 1
+	local idx = LineageData.rarityIndex(rarity)
+	data.pity.Legendary = (idx >= LineageData.rarityIndex("Legendary")) and 0 or (data.pity.Legendary + 1)
+	data.pity.Mythic = (idx >= LineageData.rarityIndex("Mythic")) and 0 or (data.pity.Mythic + 1)
+
+	PlayerDataService:MarkDirty(player)
+	ProgressionService:SetLineage(player, lineageId)
+	player:SetAttribute("Spins", data.spins)
+
+	-- Save right away for high-rarity results so a crash can't lose them
+	if idx >= LineageData.rarityIndex("Legendary") then
+		task.spawn(function() PlayerDataService:SaveNow(player) end)
+	end
+	return lineageId, rarity
+end
+
+local function onRequest(player, kind)
+	if kind ~= "Lineage" then return end
+	if busy[player] then return end
+	local t = os.clock()
+	if t - (lastRoll[player] or 0) < ROLL_COOLDOWN then return end
+	lastRoll[player] = t
+
+	busy[player] = true
+	local ok, a, b = pcall(RollService.RollLineage, RollService, player)
+	busy[player] = nil
+	if not ok then warn("[RollService]", a) return end
+
+	local data = PlayerDataService:GetProfile(player)
+	if a then
+		RollResult:FireClient(player, a, b, data.spins, data.pity)
+	else
+		RollResult:FireClient(player, nil, b, data and data.spins or 0, data and data.pity)
+	end
+end
+
+function RollService:Init()
+	RollRequest.OnServerEvent:Connect(onRequest)
+	Players.PlayerRemoving:Connect(function(p) busy[p] = nil; lastRoll[p] = nil end)
+end
+
+return RollService
