@@ -1,0 +1,250 @@
+-- NPCService (ModuleScript, ServerScriptService)
+-- Spawns greybox NPCs with ProximityPrompts and runs dialogue SERVER-SIDE (the server tracks which node
+-- each player is on; the client only sends a choice index, so it can't skip to rewards).
+--
+-- Public API:
+--   NPCService.IsNear(player, npcId | nil, range?) -> boolean   (ShopService uses this)
+--   NPCService.GetNPCForShop(shopId) -> npcId?
+-- NEEDS ART: NPC models are block rigs. Swap in real models by putting a Model named <NpcId> in
+--   ServerStorage/NPCModels - NPCService will clone it instead of building a greybox one.
+
+local Players = game:GetService("Players")
+local ServerStorage = game:GetService("ServerStorage")
+local CollectionService = game:GetService("CollectionService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Remotes = require(ReplicatedStorage:WaitForChild("Remotes"))
+local DialogueData = require(ReplicatedStorage:WaitForChild("DialogueData"))
+local Locator = require(script.Parent:WaitForChild("ServiceLocator"))
+
+local TALK_RANGE = 14
+
+local NPCService = {}
+local npcModels: { [string]: Model } = {}
+local sessions: { [Player]: { NpcId: string, Node: string } } = {}
+
+local function root(m: Model): BasePart?
+	return (m.PrimaryPart or m:FindFirstChild("HumanoidRootPart")) :: BasePart?
+end
+
+local function buildGreybox(npcId, def, cf: CFrame): Model
+	local custom = ServerStorage:FindFirstChild("NPCModels") and ServerStorage.NPCModels:FindFirstChild(npcId)
+	local model
+	if custom then
+		model = custom:Clone()
+		model:PivotTo(cf)
+	else
+		model = Instance.new("Model")
+		local function part(name, size, offset, color)
+			local p = Instance.new("Part")
+			p.Name = name; p.Size = size; p.Anchored = true; p.CanCollide = name == "HumanoidRootPart"
+			p.Color = color; p.Material = Enum.Material.SmoothPlastic
+			p.CFrame = cf * offset
+			p.Transparency = name == "HumanoidRootPart" and 1 or 0
+			p.Parent = model
+			return p
+		end
+		local hrp = part("HumanoidRootPart", Vector3.new(2, 2, 1), CFrame.new(0, 3, 0), def.Color)
+		part("Torso", Vector3.new(2, 2, 1), CFrame.new(0, 3, 0), def.Color)
+		part("Head", Vector3.new(1.2, 1.2, 1.2), CFrame.new(0, 4.6, 0), Color3.fromRGB(200, 180, 160))
+		part("LeftLeg", Vector3.new(1, 2, 1), CFrame.new(-0.5, 1, 0), Color3.fromRGB(30, 30, 40))
+		part("RightLeg", Vector3.new(1, 2, 1), CFrame.new(0.5, 1, 0), Color3.fromRGB(30, 30, 40))
+		model.PrimaryPart = hrp
+	end
+	model.Name = "NPC_" .. npcId
+	model:SetAttribute("NpcId", npcId)
+
+	-- Name tag
+	local r = root(model)
+	if r then
+		local bb = Instance.new("BillboardGui")
+		bb.Size = UDim2.fromOffset(200, 44); bb.StudsOffset = Vector3.new(0, 3.5, 0); bb.MaxDistance = 60; bb.AlwaysOnTop = true
+		local n = Instance.new("TextLabel")
+		n.Size = UDim2.new(1, 0, 0.6, 0); n.BackgroundTransparency = 1; n.Font = Enum.Font.GothamBold; n.TextScaled = true
+		n.TextColor3 = Color3.new(1, 1, 1); n.TextStrokeTransparency = 0.4; n.Text = def.Name; n.Parent = bb
+		local t = n:Clone(); t.Size = UDim2.new(1, 0, 0.4, 0); t.Position = UDim2.fromScale(0, 0.6); t.Font = Enum.Font.Gotham
+		t.TextColor3 = Color3.fromRGB(180, 160, 220); t.Text = def.Title or ""; t.Parent = bb
+		bb.Parent = r
+
+		local prompt = Instance.new("ProximityPrompt")
+		prompt.ActionText = "Talk"; prompt.ObjectText = def.Name; prompt.MaxActivationDistance = TALK_RANGE - 2
+		prompt.KeyboardKeyCode = Enum.KeyCode.E -- ASSUMPTION: E isn't a combat key. If it is, change it here.
+		prompt.RequiresLineOfSight = false
+		prompt.Parent = r
+		prompt.Triggered:Connect(function(player) NPCService.StartDialogue(player, npcId) end)
+	end
+	CollectionService:AddTag(model, "NPC")
+	model.Parent = workspace:FindFirstChild("NPCs") or (function()
+		local f = Instance.new("Folder"); f.Name = "NPCs"; f.Parent = workspace; return f
+	end)()
+	return model
+end
+
+-- Mission-state checks used by dialogue `Requires` (ASSUMPTION: adapter names; falls back to save data)
+local function missionState(player, missionId): string -- "Active" | "Completed" | "None"
+	local _, done = Locator.Try("missionCompleted", { "MissionService.IsCompleted", "MissionService.HasCompleted", "MissionService.IsMissionComplete" }, player, missionId)
+	if done == true then return "Completed" end
+	local _, active = Locator.Try("missionActive", { "MissionService.IsActive", "MissionService.HasMission", "MissionService.IsMissionActive" }, player, missionId)
+	if active == true then return "Active" end
+	local d = Locator.GetData(player)
+	if d then
+		local c = d.CompletedMissions or (d.Missions and d.Missions.Completed)
+		if type(c) == "table" and (c[missionId] or table.find(c, missionId)) then return "Completed" end
+		local a = d.ActiveMissions or (d.Missions and d.Missions.Active)
+		if type(a) == "table" and (a[missionId] or table.find(a, missionId)) then return "Active" end
+	end
+	return "None"
+end
+
+-- Is a mission ready to turn in? (all objectives met)  ASSUMPTION: adapter names; else treated as not ready
+local function missionReady(player, missionId): boolean
+	local _, r = Locator.Try("missionReady", { "MissionService.IsReadyToTurnIn", "MissionService.CanTurnIn", "MissionService.IsObjectiveComplete" }, player, missionId)
+	return r == true
+end
+
+-- Requires = { MissionActive = id } | { MissionCompleted = id } | { MissionNotStarted = id } | { MissionReady = id }
+local function meets(player, req): boolean
+	if not req then return true end
+	if req.MissionActive and missionState(player, req.MissionActive) ~= "Active" then return false end
+	if req.MissionCompleted and missionState(player, req.MissionCompleted) ~= "Completed" then return false end
+	if req.MissionNotStarted and missionState(player, req.MissionNotStarted) ~= "None" then return false end
+	if req.MissionReady and not (missionState(player, req.MissionReady) == "Active" and missionReady(player, req.MissionReady)) then return false end
+	return true
+end
+
+local function sendNode(player, npcId, nodeId)
+	local def = DialogueData.NPCs[npcId]
+	local node = def and def.Nodes[nodeId]
+	if not node then NPCService.EndDialogue(player) return end
+	-- Node-level redirect: { Redirect = { { Requires = {...}, To = "nodeId" }, ... } }
+	for _, r in node.Redirect or {} do
+		if meets(player, r.Requires) and def.Nodes[r.To] and r.To ~= nodeId then return sendNode(player, npcId, r.To) end
+	end
+	local visible, choices = {}, {}
+	for _, c in node.Choices or {} do
+		if meets(player, c.Requires) then table.insert(visible, c); table.insert(choices, c.Text) end
+	end
+	sessions[player] = { NpcId = npcId, Node = nodeId, Visible = visible }
+	Remotes.Event("DialogueShow"):FireClient(player, { NpcName = def.Name, Title = def.Title, Text = node.Text, Choices = choices })
+end
+
+function NPCService.IsNear(player: Player, npcId: string?, range: number?): boolean
+	local pr = player.Character and player.Character:FindFirstChild("HumanoidRootPart") :: BasePart?
+	if not pr then return false end
+	range = range or TALK_RANGE
+	for id, m in npcModels do
+		if npcId == nil or id == npcId then
+			local r = root(m)
+			if r and (r.Position - pr.Position).Magnitude <= range then return true end
+		end
+	end
+	return false
+end
+
+function NPCService.GetNPCForShop(shopId: string): string?
+	for id, def in DialogueData.NPCs do
+		for _, node in def.Nodes do
+			for _, c in node.Choices or {} do
+				if c.Action and c.Action.Type == "OpenShop" and c.Action.ShopId == shopId then return id end
+			end
+		end
+	end
+	return nil
+end
+
+function NPCService.StartDialogue(player: Player, npcId: string)
+	if not NPCService.IsNear(player, npcId) then return end
+	local def = DialogueData.NPCs[npcId]
+	if def then sendNode(player, npcId, def.Start or "greet") end
+end
+
+function NPCService.EndDialogue(player: Player)
+	sessions[player] = nil
+	Remotes.Event("DialogueClose"):FireClient(player)
+end
+
+local ACTIONS = {}
+function ACTIONS.Close(player) NPCService.EndDialogue(player) end
+function ACTIONS.Heal(player)
+	local h = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+	if h and h.Health > 0 then h.Health = h.MaxHealth end
+	Remotes.Event("Notify"):FireClient(player, "Healed.", "Good")
+	NPCService.EndDialogue(player)
+end
+function ACTIONS.OpenShop(player, a)
+	NPCService.EndDialogue(player)
+	local shop = Locator.Service("ShopService")
+	if shop then shop.Open(player, a.ShopId) end
+end
+function ACTIONS.OfferMission(player, a)
+	NPCService.EndDialogue(player)
+	local found, res = Locator.Try("acceptMission", { "MissionService.AcceptMission", "MissionService.StartMission" }, player, a.MissionId)
+	if found and res ~= false then
+		Remotes.Event("Notify"):FireClient(player, "Mission accepted.", "Good")
+	elseif found then
+		Remotes.Event("Notify"):FireClient(player, "You can't take that mission right now.", "Bad")
+	end
+	local bridge = Locator.Service("ClientBridgeService")
+	if bridge then bridge.PushMissions(player) end
+end
+
+function ACTIONS.CompleteMission(player, a)
+	NPCService.EndDialogue(player)
+	-- Server re-checks readiness; MissionService is still responsible for granting rewards.
+	if not missionReady(player, a.MissionId) then
+		Remotes.Event("Notify"):FireClient(player, "You haven't finished that yet.", "Bad")
+		return
+	end
+	local found, res = Locator.Try("turnInMission", { "MissionService.TurnIn", "MissionService.CompleteMission", "MissionService.TurnInMission" }, player, a.MissionId)
+	if found and res ~= false then Remotes.Event("Notify"):FireClient(player, "Mission complete!", "Good") end
+	local bridge = Locator.Service("ClientBridgeService")
+	if bridge then bridge.PushMissions(player); bridge.PushInventory(player) end
+end
+
+function NPCService.Init() end
+
+function NPCService.Start()
+	-- Place NPCs: tagged spawn parts first, fallback ring around a SpawnLocation
+	local placed = {}
+	for _, p in CollectionService:GetTagged("NPCSpawn") do
+		local id = p:GetAttribute("NpcId")
+		if p:IsA("BasePart") and id and DialogueData.NPCs[id] and not placed[id] then
+			npcModels[id] = buildGreybox(id, DialogueData.NPCs[id], p.CFrame * CFrame.new(0, p.Size.Y / 2, 0))
+			placed[id] = true
+		end
+	end
+	local spawn = workspace:FindFirstChildWhichIsA("SpawnLocation", true)
+	local center = spawn and spawn.Position or Vector3.new(0, 0, 0)
+	local i = 0
+	for id, def in DialogueData.NPCs do
+		if not placed[id] then
+			i += 1
+			local angle = i * (math.pi * 2 / 6)
+			local pos = center + Vector3.new(math.cos(angle) * 22, 0, math.sin(angle) * 22)
+			npcModels[id] = buildGreybox(id, def, CFrame.lookAt(pos, Vector3.new(center.X, pos.Y, center.Z)))
+			warn(("[NPCService] no NPCSpawn tag for '%s' - placed near spawn"):format(id))
+		end
+	end
+
+	Remotes.Event("DialogueChoice").OnServerEvent:Connect(function(player, index)
+		if not Remotes.RateLimit(player, "dialogue", 4, 6) then return end
+		local s = sessions[player]
+		if not s or type(index) ~= "number" then return end
+		if not NPCService.IsNear(player, s.NpcId, TALK_RANGE + 6) then NPCService.EndDialogue(player) return end
+		local choice = s.Visible and s.Visible[math.floor(index)]
+		if not choice then return end
+		if not meets(player, choice.Requires) then sendNode(player, s.NpcId, s.Node) return end -- state changed since shown
+		if choice.Next then
+			sendNode(player, s.NpcId, choice.Next)
+		elseif choice.Action then
+			local fn = ACTIONS[choice.Action.Type]
+			if fn then fn(player, choice.Action) else NPCService.EndDialogue(player) end
+		else
+			NPCService.EndDialogue(player)
+		end
+	end)
+
+	Players.PlayerRemoving:Connect(function(p) sessions[p] = nil end)
+end
+
+return NPCService
