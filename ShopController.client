@@ -1,0 +1,98 @@
+-- ShopController (LocalScript, StarterPlayerScripts)
+-- Vendor window opened by the server (via NPC dialogue). Buy tab = shop stock, Sell tab = your inventory.
+-- Also shows a small currency counter on the HUD (bottom-right).
+-- ASSUMPTION: your HUDController doesn't already show currency. If it does, set SHOW_HUD_CURRENCY = false.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Remotes = require(ReplicatedStorage:WaitForChild("Remotes"))
+local UIKit = require(ReplicatedStorage:WaitForChild("UIKit"))
+local T = UIKit.Theme
+
+local SHOW_HUD_CURRENCY = true
+
+local gui = UIKit.Screen("ShopUI", 32)
+local panel, body = UIKit.Panel(gui, "Shop", UDim2.fromOffset(480, 440))
+panel.Visible = false
+
+local walletLbl = UIKit.Label(body, "", UDim2.new(1, 0, 0, 20), nil, { Font = T.FontBold, TextColor3 = UIKit.RarityColors.Legendary })
+local buyTab = UIKit.Button(body, "Buy", UDim2.new(0.5, -4, 0, 28), UDim2.fromOffset(0, 26))
+local sellTab = UIKit.Button(body, "Sell", UDim2.new(0.5, -4, 0, 28), UDim2.new(0.5, 4, 0, 26))
+local qtyBox = Instance.new("TextBox")
+qtyBox.Size = UDim2.new(0, 60, 0, 24); qtyBox.Position = UDim2.new(1, -60, 0, 60)
+qtyBox.BackgroundColor3 = T.Bg; qtyBox.TextColor3 = T.Text; qtyBox.Font = T.Font; qtyBox.TextSize = 14
+qtyBox.Text = "1"; qtyBox.PlaceholderText = "Qty"; qtyBox.Parent = body
+UIKit.Label(body, "Quantity:", UDim2.new(0, 80, 0, 24), UDim2.new(1, -144, 0, 60), { TextColor3 = T.SubText, TextXAlignment = Enum.TextXAlignment.Right })
+local list = UIKit.Scroll(body, UDim2.new(1, 0, 1, -92), UDim2.fromOffset(0, 92))
+
+local hudLbl
+if SHOW_HUD_CURRENCY then
+	hudLbl = UIKit.Label(gui, "", UDim2.fromOffset(200, 26), UDim2.new(1, -216, 1, -40), {
+		Font = T.FontBold, TextSize = 18, TextColor3 = UIKit.RarityColors.Legendary, TextXAlignment = Enum.TextXAlignment.Right,
+		TextStrokeTransparency = 0.5,
+	})
+end
+
+local shop = nil
+local tab = "Buy"
+local inventory = {}
+local currencyName = "Yen"
+
+local function setCurrency(amount, name)
+	currencyName = name or currencyName
+	local txt = ("%s %s"):format(tostring(amount or 0), currencyName)
+	walletLbl.Text = "Wallet: " .. txt
+	if hudLbl then hudLbl.Text = txt end
+end
+
+local function qty() return math.clamp(math.floor(tonumber(qtyBox.Text) or 1), 1, 99) end
+
+local function transact(kind, arg)
+	if not shop then return end
+	local res = Remotes.Function("ShopTransaction"):InvokeServer(kind, shop.ShopId, arg, qty())
+	if not res then return end
+	if res.Ok then UIKit.Toast(kind == "Buy" and "Purchased." or "Sold.", T.Good) else UIKit.Toast(res.Reason or "Failed", T.Bad) end
+	if res.Currency then setCurrency(res.Currency) end
+end
+
+local function render()
+	if not shop then return end
+	buyTab.BackgroundColor3 = tab == "Buy" and T.Accent or T.AccentDim
+	sellTab.BackgroundColor3 = tab == "Sell" and T.Accent or T.AccentDim
+	sellTab.Visible = shop.CanSell == true
+	UIKit.Clear(list)
+	if tab == "Buy" then
+		for _, s in shop.Stock do
+			local row = UIKit.Button(list, "", UDim2.new(1, 0, 0, 40))
+			row.BackgroundColor3 = T.Panel
+			UIKit.Label(row, s.Name, UDim2.new(1, -120, 0, 20), UDim2.fromOffset(8, 2), { TextColor3 = UIKit.RarityColors[s.Rarity] or T.Text, Font = T.FontBold })
+			UIKit.Label(row, s.Description, UDim2.new(1, -120, 0, 16), UDim2.fromOffset(8, 22), { TextColor3 = T.SubText, TextSize = 12, TextTruncate = Enum.TextTruncate.AtEnd })
+			UIKit.Label(row, s.Price .. " " .. currencyName, UDim2.new(0, 104, 1, 0), UDim2.new(1, -110, 0, 0), { TextXAlignment = Enum.TextXAlignment.Right, TextColor3 = UIKit.RarityColors.Legendary })
+			row.MouseButton1Click:Connect(function() transact("Buy", s.Index) end)
+		end
+	else
+		local rate = shop.SellRate or 0.3
+		for _, it in inventory do
+			if not it.Equipped then
+				local row = UIKit.Button(list, "", UDim2.new(1, 0, 0, 32))
+				row.BackgroundColor3 = T.Panel
+				UIKit.Label(row, it.Name .. "  x" .. it.Quantity, UDim2.new(1, -120, 1, 0), UDim2.fromOffset(8, 0), { TextColor3 = UIKit.RarityColors[it.Rarity] or T.Text })
+				UIKit.Label(row, ("sell @ %d%%"):format(rate * 100), UDim2.new(0, 104, 1, 0), UDim2.new(1, -110, 0, 0), { TextXAlignment = Enum.TextXAlignment.Right, TextColor3 = T.SubText })
+				row.MouseButton1Click:Connect(function() transact("Sell", it.ItemId) end)
+			end
+		end
+	end
+end
+
+buyTab.MouseButton1Click:Connect(function() tab = "Buy"; render() end)
+sellTab.MouseButton1Click:Connect(function() tab = "Sell"; render() end)
+
+Remotes.Event("ShopOpen").OnClientEvent:Connect(function(data)
+	shop = data
+	tab = "Buy"
+	panel.Title.Text = "  " .. (data.Name or "Shop"):upper()
+	setCurrency(data.Currency, data.CurrencyName)
+	panel.Visible = true
+	render()
+end)
+Remotes.Event("CurrencySync").OnClientEvent:Connect(function(amount, name) setCurrency(amount, name) end)
+Remotes.Event("InventorySync").OnClientEvent:Connect(function(inv) inventory = inv or {}; if panel.Visible and tab == "Sell" then render() end end)
