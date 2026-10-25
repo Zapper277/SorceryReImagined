@@ -1,0 +1,169 @@
+--!nonstrict
+--[[
+	TechniqueData  (ReplicatedStorage/Shared/TechniqueData)
+	HEXBOUND - data-driven technique definitions. Frames are at 60 FPS.
+	Shared with clients for UI only (names, icons, cooldowns). The server reads this
+	same table, so clients can't change balance.
+
+	Kinds and the fields each uses:
+	  Melee      : hitbox = { size, offset }, hit = {...}
+	  Projectile : projectile = { speed, radius, range }, hit = {...}
+	  Dash       : dash = { speed, duration }, optional hitbox + hit (a strike during the dash)
+	  Burst      : hitbox (centered on the caster: offset 0), hit = {...}, knockback pushes outward
+
+	The `hit` table uses the same fields as an M1 hit in CombatFrameData
+	(damage, hitstun, blockstun, guardDamage, knockback?, unblockable?, unparryable?, hexGain?).
+	Techniques default to hexGain = 0 so spending Hex doesn't refund itself.
+]]
+
+local TechniqueData = {}
+
+TechniqueData.Techniques = {
+	------------------------------------------------------------------
+	-- Starter set: "Ashen Script"  (placeholder starter kit until Lineages define their own)
+	------------------------------------------------------------------
+	CinderBolt = {
+		name = "Cinder Bolt",
+		kind = "Projectile",
+		hexCost = 15, cooldown = 4,
+		startup = 12, active = 1, recovery = 18,
+		projectile = { speed = 110, radius = 1.25, range = 120 },
+		hit = { name = "CinderBolt", damage = 9, hitstun = 20, blockstun = 12, guardDamage = 15, hexGain = 0 },
+	},
+	RendingPalm = {
+		name = "Rending Palm",
+		kind = "Melee",
+		hexCost = 20, cooldown = 7,
+		startup = 14, active = 4, recovery = 24,
+		hitbox = { size = Vector3.new(6, 6, 7), offset = 4 },
+		-- Breaks guard on block and can't be parried, so it beats turtling but has a slow, reactable startup
+		hit = { name = "RendingPalm", damage = 12, hitstun = 30, blockstun = 20, guardDamage = 60,
+		        unparryable = true, hexGain = 0,
+		        knockback = { horizontal = 40, vertical = 10, duration = 0.15 } },
+	},
+	VeilStep = {
+		name = "Veil Step",
+		kind = "Dash",
+		hexCost = 10, cooldown = 5,
+		startup = 3, active = 10, recovery = 8,
+		dash = { speed = 85, duration = 10 / 60 },
+		-- No hitbox: this is pure movement
+	},
+	GraveRing = {
+		name = "Grave Ring",
+		kind = "Burst",
+		hexCost = 35, cooldown = 14,
+		startup = 18, active = 3, recovery = 30,
+		hitbox = { size = Vector3.new(14, 7, 14), offset = 0 },
+		-- Combo breaker / space maker: big area, launches outward, very punishable if whiffed
+		hit = { name = "GraveRing", damage = 10, hitstun = 28, blockstun = 18, guardDamage = 35, hexGain = 0,
+		        knockback = { horizontal = 60, vertical = 25, duration = 0.2, outward = true } },
+	},
+
+	------------------------------------------------------------------
+	-- Iron Vow (Common): grappler / guard pressure
+	------------------------------------------------------------------
+	OathBreaker = {
+		name = "Oathbreaker", kind = "Melee", hexCost = 18, cooldown = 6,
+		startup = 10, active = 4, recovery = 20,
+		hitbox = { size = Vector3.new(5, 6, 6), offset = 3.5 },
+		hit = { name = "OathBreaker", damage = 8, hitstun = 26, blockstun = 22, guardDamage = 45, hexGain = 0 },
+	},
+	ShackleRush = {
+		name = "Shackle Rush", kind = "Dash", hexCost = 15, cooldown = 6,
+		startup = 6, active = 12, recovery = 14,
+		dash = { speed = 70, duration = 12 / 60 },
+		hitbox = { size = Vector3.new(5, 5, 5), offset = 3 },
+		hit = { name = "ShackleRush", damage = 6, hitstun = 24, blockstun = 12, guardDamage = 15, hexGain = 0 },
+	},
+
+	------------------------------------------------------------------
+	-- Gloam Thread (Uncommon): mid-range control
+	------------------------------------------------------------------
+	ThreadLash = {
+		name = "Thread Lash", kind = "Melee", hexCost = 12, cooldown = 3,
+		startup = 9, active = 3, recovery = 16,
+		hitbox = { size = Vector3.new(4, 4, 12), offset = 7 },
+		hit = { name = "ThreadLash", damage = 6, hitstun = 22, blockstun = 10, guardDamage = 10, hexGain = 0 },
+	},
+	SnareNeedle = {
+		name = "Snare Needle", kind = "Projectile", hexCost = 14, cooldown = 5,
+		startup = 10, active = 1, recovery = 16,
+		projectile = { speed = 150, radius = 0.8, range = 140 },
+		hit = { name = "SnareNeedle", damage = 5, hitstun = 40, blockstun = 10, guardDamage = 8, hexGain = 0 },
+	},
+
+	------------------------------------------------------------------
+	-- Tidebinder (Rare): zoning
+	------------------------------------------------------------------
+	UndertowOrb = {
+		name = "Undertow Orb", kind = "Projectile", hexCost = 20, cooldown = 6,
+		startup = 14, active = 1, recovery = 20,
+		projectile = { speed = 70, radius = 2.5, range = 100 },
+		hit = { name = "UndertowOrb", damage = 12, hitstun = 26, blockstun = 16, guardDamage = 25, hexGain = 0,
+		        knockback = { horizontal = 35, vertical = 8, duration = 0.15 } },
+	},
+	RiptideRing = {
+		name = "Riptide Ring", kind = "Burst", hexCost = 30, cooldown = 12,
+		startup = 16, active = 3, recovery = 26,
+		hitbox = { size = Vector3.new(16, 6, 16), offset = 0 },
+		hit = { name = "RiptideRing", damage = 9, hitstun = 26, blockstun = 16, guardDamage = 30, hexGain = 0,
+		        knockback = { horizontal = 50, vertical = 15, duration = 0.18, outward = true } },
+	},
+
+	------------------------------------------------------------------
+	-- Hollow Crown (Legendary): rushdown
+	------------------------------------------------------------------
+	CrownFall = {
+		name = "Crownfall", kind = "Melee", hexCost = 25, cooldown = 8,
+		startup = 12, active = 5, recovery = 22,
+		hitbox = { size = Vector3.new(8, 8, 8), offset = 4 },
+		hit = { name = "CrownFall", damage = 16, hitstun = 32, blockstun = 20, guardDamage = 40, hexGain = 0,
+		        knockback = { horizontal = 20, vertical = 45, duration = 0.2 } },
+	},
+	HollowStep = {
+		name = "Hollow Step", kind = "Dash", hexCost = 8, cooldown = 3,
+		startup = 2, active = 8, recovery = 6,
+		dash = { speed = 100, duration = 8 / 60 },
+	},
+
+	------------------------------------------------------------------
+	-- Sable Eclipse (Mythic): all-rounder with a long-range finisher
+	------------------------------------------------------------------
+	UmbralSpear = {
+		name = "Umbral Spear", kind = "Projectile", hexCost = 30, cooldown = 9,
+		startup = 18, active = 1, recovery = 22,
+		projectile = { speed = 180, radius = 1.5, range = 200 },
+		hit = { name = "UmbralSpear", damage = 18, hitstun = 30, blockstun = 20, guardDamage = 40, unparryable = true, hexGain = 0,
+		        knockback = { horizontal = 45, vertical = 10, duration = 0.15 } },
+	},
+	EclipseVeil = {
+		name = "Eclipse Veil", kind = "Burst", hexCost = 40, cooldown = 16,
+		startup = 12, active = 4, recovery = 28,
+		hitbox = { size = Vector3.new(18, 8, 18), offset = 0 },
+		hit = { name = "EclipseVeil", damage = 14, hitstun = 34, blockstun = 20, guardDamage = 50, unblockable = true, hexGain = 0,
+		        knockback = { horizontal = 40, vertical = 30, duration = 0.2, outward = true } },
+	},
+
+	------------------------------------------------------------------
+	-- Curse (NPC-only) techniques
+	------------------------------------------------------------------
+	CurseSpit = {
+		name = "Bile Spit", kind = "Projectile", hexCost = 0, cooldown = 5,
+		startup = 18, active = 1, recovery = 24,
+		projectile = { speed = 60, radius = 1.5, range = 70 },
+		hit = { name = "CurseSpit", damage = 6, hitstun = 18, blockstun = 10, guardDamage = 12, hexGain = 0 },
+	},
+	CurseSlam = {
+		name = "Grave Slam", kind = "Burst", hexCost = 0, cooldown = 8,
+		startup = 30, active = 4, recovery = 30,
+		hitbox = { size = Vector3.new(16, 6, 16), offset = 0 },
+		hit = { name = "CurseSlam", damage = 14, hitstun = 30, blockstun = 20, guardDamage = 40, hexGain = 0,
+		        knockback = { horizontal = 45, vertical = 25, duration = 0.2, outward = true } },
+	},
+}
+
+TechniqueData.DefaultLoadout = { "CinderBolt", "RendingPalm", "VeilStep", "GraveRing" }
+TechniqueData.MaxSlots = 4
+
+return TechniqueData
