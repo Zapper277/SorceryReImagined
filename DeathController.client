@@ -1,0 +1,68 @@
+-- DeathController (LocalScript, StarterPlayerScripts)
+-- Death screen: desaturate, "YOU DIED" + killer name, respawn countdown.
+-- ASSUMPTION: CombatService/CurseAI tag the victim's Humanoid with attribute "LastHitBy" (string name)
+--   when dealing damage. If they don't, the screen just omits the killer line. One-line add in CombatService:
+--     targetHumanoid:SetAttribute("LastHitBy", attackerName)
+-- Respawn timing uses Players.RespawnTime (Roblox default 5s). Change that in Players properties.
+
+local Players = game:GetService("Players")
+local Lighting = game:GetService("Lighting")
+local TweenService = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UIKit = require(ReplicatedStorage:WaitForChild("UIKit"))
+local T = UIKit.Theme
+local LP = Players.LocalPlayer
+
+local gui = UIKit.Screen("DeathUI", 60)
+local overlay = Instance.new("Frame")
+overlay.Size = UDim2.fromScale(1, 1)
+overlay.BackgroundColor3 = Color3.new(0, 0, 0)
+overlay.BackgroundTransparency = 1
+overlay.Visible = false
+overlay.Parent = gui
+
+local title = UIKit.Label(overlay, "YOU DIED", UDim2.new(1, 0, 0, 90), UDim2.fromScale(0, 0.35), {
+	Font = T.FontBold, TextSize = 72, TextColor3 = Color3.fromRGB(170, 20, 40), TextXAlignment = Enum.TextXAlignment.Center, TextTransparency = 1,
+})
+local killerLbl = UIKit.Label(overlay, "", UDim2.new(1, 0, 0, 30), UDim2.new(0, 0, 0.35, 92), {
+	TextSize = 20, TextColor3 = T.SubText, TextXAlignment = Enum.TextXAlignment.Center, TextTransparency = 1,
+})
+local timerLbl = UIKit.Label(overlay, "", UDim2.new(1, 0, 0, 24), UDim2.new(0, 0, 0.35, 130), {
+	TextSize = 16, TextColor3 = T.Text, TextXAlignment = Enum.TextXAlignment.Center,
+})
+
+local cc
+
+local function onDied(hum)
+	local killer = hum:GetAttribute("LastHitBy")
+	overlay.Visible = true
+	killerLbl.Text = killer and ("Slain by " .. tostring(killer)) or ""
+	TweenService:Create(overlay, TweenInfo.new(1.2), { BackgroundTransparency = 0.45 }):Play()
+	TweenService:Create(title, TweenInfo.new(0.8), { TextTransparency = 0 }):Play()
+	TweenService:Create(killerLbl, TweenInfo.new(1.2), { TextTransparency = 0 }):Play()
+	cc = Instance.new("ColorCorrectionEffect")
+	cc.Name = "DeathCC"; cc.Parent = Lighting
+	TweenService:Create(cc, TweenInfo.new(1), { Saturation = -1, Brightness = -0.1 }):Play()
+	task.spawn(function()
+		for t = math.ceil(Players.RespawnTime), 1, -1 do
+			if not overlay.Visible then return end
+			timerLbl.Text = "Respawning in " .. t .. "..."
+			task.wait(1)
+		end
+		timerLbl.Text = ""
+	end)
+end
+
+local function onCharacter(char)
+	overlay.Visible = false
+	overlay.BackgroundTransparency = 1
+	title.TextTransparency = 1
+	killerLbl.TextTransparency = 1
+	timerLbl.Text = ""
+	if cc then cc:Destroy(); cc = nil end
+	local hum = char:WaitForChild("Humanoid", 10)
+	if hum then hum.Died:Connect(function() onDied(hum) end) end
+end
+
+LP.CharacterAdded:Connect(onCharacter)
+if LP.Character then task.spawn(onCharacter, LP.Character) end
