@@ -1,0 +1,144 @@
+-- TradeController (LocalScript, StarterPlayerScripts)  -- key: T (pick a nearby player)
+-- Same-server trading UI on top of your TradeService (cross-server trading is still a known gap).
+--
+-- ASSUMPTION about the trade state TradeService returns (normalized loosely below):
+--   { Partner = Player, MyOffer = { {Uid, Name, Quantity} }, TheirOffer = {...},
+--     MyReady = bool, TheirReady = bool, MyConfirmed = bool, TheirConfirmed = bool }
+-- If your TradeService uses different keys, edit `normalize()` below.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Remotes = require(ReplicatedStorage:WaitForChild("Remotes"))
+local UIKit = require(ReplicatedStorage:WaitForChild("UIKit"))
+local T = UIKit.Theme
+local LP = Players.LocalPlayer
+
+local TOGGLE_KEY = Enum.KeyCode.T -- ASSUMPTION: not used by CombatController
+local TRADE_RANGE = 25
+
+local gui = UIKit.Screen("TradeUI", 30)
+
+-- Player picker --------------------------------------------------------------
+local picker, pickerBody = UIKit.Panel(gui, "Trade With", UDim2.fromOffset(260, 300))
+picker.Visible = false
+local pickList = UIKit.Scroll(pickerBody, UDim2.fromScale(1, 1))
+
+local function refreshPicker()
+	UIKit.Clear(pickList)
+	local myRoot = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+	local count = 0
+	for _, p in Players:GetPlayers() do
+		local r = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+		if p ~= LP and myRoot and r and (r.Position - myRoot.Position).Magnitude <= TRADE_RANGE then
+			count += 1
+			local b = UIKit.Button(pickList, p.DisplayName, UDim2.new(1, 0, 0, 30))
+			b.MouseButton1Click:Connect(function()
+				Remotes.Event("TradeAction"):FireServer("Request", p)
+				picker.Visible = false
+			end)
+		end
+	end
+	if count == 0 then UIKit.Label(pickList, "No players within " .. TRADE_RANGE .. " studs.", UDim2.new(1, 0, 0, 24), nil, { TextColor3 = T.SubText }) end
+end
+UIKit.BindToggle(TOGGLE_KEY, picker, refreshPicker)
+
+-- Incoming request popup ------------------------------------------------------
+local function incoming(from: Player)
+	local pop, pb = UIKit.Panel(gui, "Trade Request", UDim2.fromOffset(300, 130), UDim2.new(0.5, 0, 0.3, 0))
+	UIKit.Label(pb, from.DisplayName .. " wants to trade.", UDim2.new(1, 0, 0, 30), nil, { TextXAlignment = Enum.TextXAlignment.Center })
+	local yes = UIKit.Button(pb, "Accept", UDim2.new(0.5, -4, 0, 30), UDim2.new(0, 0, 0, 44)); yes.BackgroundColor3 = T.Good
+	local no = UIKit.Button(pb, "Decline", UDim2.new(0.5, -4, 0, 30), UDim2.new(0.5, 4, 0, 44)); no.BackgroundColor3 = T.Bad
+	yes.MouseButton1Click:Connect(function() Remotes.Event("TradeAction"):FireServer("Accept", from); pop:Destroy() end)
+	no.MouseButton1Click:Connect(function() Remotes.Event("TradeAction"):FireServer("Decline", from); pop:Destroy() end)
+	task.delay(30, function() if pop.Parent then pop:Destroy() end end)
+end
+Remotes.Event("TradeIncoming").OnClientEvent:Connect(incoming)
+
+-- Trade window -----------------------------------------------------------------
+local win, wb = UIKit.Panel(gui, "Trade", UDim2.fromOffset(640, 420))
+win.Visible = false
+local partnerLbl = UIKit.Label(wb, "", UDim2.new(1, 0, 0, 20), nil, { Font = T.FontBold })
+
+local function column(title, x)
+	UIKit.Label(wb, title, UDim2.new(1 / 3, -6, 0, 18), UDim2.new(x, 0, 0, 24), { TextColor3 = T.SubText, TextSize = 12 })
+	return UIKit.Scroll(wb, UDim2.new(1 / 3, -6, 1, -100), UDim2.new(x, 0, 0, 44))
+end
+local invCol = column("YOUR INVENTORY (click to offer)", 0)
+local myCol = column("YOUR OFFER (click to remove)", 1 / 3)
+local theirCol = column("THEIR OFFER", 2 / 3)
+
+local readyBtn = UIKit.Button(wb, "Ready", UDim2.new(1 / 3, -6, 0, 34), UDim2.new(0, 0, 1, -40))
+local confirmBtn = UIKit.Button(wb, "Confirm", UDim2.new(1 / 3, -6, 0, 34), UDim2.new(1 / 3, 0, 1, -40))
+local cancelBtn = UIKit.Button(wb, "Cancel", UDim2.new(1 / 3, -6, 0, 34), UDim2.new(2 / 3, 0, 1, -40))
+confirmBtn.BackgroundColor3 = T.Good
+cancelBtn.BackgroundColor3 = T.Bad
+
+readyBtn.MouseButton1Click:Connect(function() Remotes.Event("TradeAction"):FireServer("Ready") end)
+confirmBtn.MouseButton1Click:Connect(function() Remotes.Event("TradeAction"):FireServer("Confirm") end)
+cancelBtn.MouseButton1Click:Connect(function() Remotes.Event("TradeAction"):FireServer("Cancel"); win.Visible = false end)
+
+local myInventory = {}
+Remotes.Event("InventorySync").OnClientEvent:Connect(function(inv) myInventory = inv or {} end)
+
+local function offerList(raw)
+	local out = {}
+	for k, v in raw or {} do
+		if type(v) == "table" then
+			table.insert(out, { Uid = v.Uid or v.Id or k, Name = v.Name or tostring(v.ItemId or v.Id or k), Quantity = v.Quantity or v.Amount or 1 })
+		elseif type(v) == "number" then
+			table.insert(out, { Uid = k, Name = tostring(k), Quantity = v })
+		end
+	end
+	return out
+end
+
+local function normalize(s)
+	if type(s) ~= "table" then return nil end
+	return {
+		Partner = s.Partner or s.Other,
+		Mine = offerList(s.MyOffer or s.Mine or s.Offer),
+		Theirs = offerList(s.TheirOffer or s.Theirs or s.PartnerOffer),
+		MyReady = s.MyReady or s.Ready, TheirReady = s.TheirReady or s.PartnerReady,
+		MyConfirmed = s.MyConfirmed, TheirConfirmed = s.TheirConfirmed,
+		Done = s.Completed or s.Done, Cancelled = s.Cancelled,
+	}
+end
+
+local function render(st)
+	partnerLbl.Text = "Trading with " .. (typeof(st.Partner) == "Instance" and st.Partner.DisplayName or "?")
+		.. "   |   You: " .. (st.MyConfirmed and "CONFIRMED" or st.MyReady and "READY" or "editing")
+		.. "   Them: " .. (st.TheirConfirmed and "CONFIRMED" or st.TheirReady and "READY" or "editing")
+	local offered = {}
+	UIKit.Clear(myCol)
+	for _, it in st.Mine do
+		offered[it.Uid] = true
+		local b = UIKit.Button(myCol, it.Name .. " x" .. it.Quantity, UDim2.new(1, 0, 0, 28))
+		b.MouseButton1Click:Connect(function() Remotes.Event("TradeAction"):FireServer("Remove", it.Uid) end)
+	end
+	UIKit.Clear(theirCol)
+	for _, it in st.Theirs do
+		UIKit.Label(theirCol, it.Name .. " x" .. it.Quantity, UDim2.new(1, 0, 0, 24))
+	end
+	UIKit.Clear(invCol)
+	for _, it in myInventory do
+		if not offered[it.Uid] and not it.Equipped then
+			local b = UIKit.Button(invCol, it.Name .. " x" .. it.Quantity, UDim2.new(1, 0, 0, 28))
+			b.BackgroundColor3 = T.Panel
+			b.TextColor3 = UIKit.RarityColors[it.Rarity] or T.Text
+			b.MouseButton1Click:Connect(function() Remotes.Event("TradeAction"):FireServer("Add", it.Uid, 1) end)
+		end
+	end
+	confirmBtn.Visible = st.MyReady and st.TheirReady
+end
+
+Remotes.Event("TradeUpdate").OnClientEvent:Connect(function(raw)
+	local st = normalize(raw)
+	if not st or st.Cancelled then
+		if win.Visible then UIKit.Toast("Trade closed.", T.SubText) end
+		win.Visible = false
+		return
+	end
+	if st.Done then win.Visible = false; UIKit.Toast("Trade complete!", T.Good) return end
+	win.Visible = true
+	render(st)
+end)
