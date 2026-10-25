@@ -1,0 +1,62 @@
+-- SettingsService (ModuleScript, ServerScriptService)
+-- Saves per-player client settings inside the PlayerDataService save table (data.Settings).
+-- ASSUMPTION: PlayerDataService returns a live, mutable table that it auto-saves (ProfileService-style).
+-- If it doesn't, settings still work for the session; add a "Settings" field to your default data template.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Remotes = require(ReplicatedStorage:WaitForChild("Remotes"))
+local Locator = require(script.Parent:WaitForChild("ServiceLocator"))
+
+local SettingsService = {}
+
+-- Allowed keys + validators. Anything else the client sends is dropped.
+local SCHEMA = {
+	MasterVolume = function(v) return type(v) == "number" and math.clamp(v, 0, 1) end,
+	MusicVolume  = function(v) return type(v) == "number" and math.clamp(v, 0, 1) end,
+	CameraShake  = function(v) return type(v) == "boolean" and v end,
+	ShowTracker  = function(v) return type(v) == "boolean" and v end,
+	DamageNumbers = function(v) return type(v) == "boolean" and v end,
+	UIScale      = function(v) return type(v) == "number" and math.clamp(v, 0.75, 1.5) end,
+	Keybinds     = function(v)
+		if type(v) ~= "table" then return nil end
+		local out = {}
+		for action, key in v do
+			if type(action) == "string" and #action <= 24 and type(key) == "string" and Enum.KeyCode[key] then out[action] = key end
+		end
+		return out
+	end,
+}
+
+local DEFAULTS = { MasterVolume = 0.8, MusicVolume = 0.5, CameraShake = true, ShowTracker = true, UIScale = 1, DamageNumbers = true, Keybinds = {} }
+local session: { [Player]: { [string]: any } } = {}
+
+local function get(player)
+	local d = Locator.GetData(player)
+	local s = (d and type(d.Settings) == "table" and d.Settings) or session[player]
+	if not s then
+		s = table.clone(DEFAULTS); s.Keybinds = {}
+		if d then d.Settings = s else session[player] = s end
+	end
+	for k, v in DEFAULTS do if s[k] == nil then s[k] = v end end
+	return s
+end
+
+function SettingsService.Get(player) return get(player) end
+function SettingsService.Init() end
+
+function SettingsService.Start()
+	Remotes.Function("GetSettings").OnServerInvoke = function(player) return get(player) end
+	Remotes.Event("SettingsSave").OnServerEvent:Connect(function(player, incoming)
+		if not Remotes.RateLimit(player, "settings", 1, 3) or type(incoming) ~= "table" then return end
+		local s = get(player)
+		for k, validate in SCHEMA do
+			if incoming[k] ~= nil then
+				local v = validate(incoming[k])
+				if v ~= nil then s[k] = v end
+			end
+		end
+	end)
+	game:GetService("Players").PlayerRemoving:Connect(function(p) session[p] = nil end)
+end
+
+return SettingsService
