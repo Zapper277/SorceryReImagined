@@ -1,0 +1,70 @@
+-- DamageNumbers (LocalScript, StarterPlayerScripts)
+-- Floating damage/heal numbers over any Humanoid that loses or gains health near you.
+-- Purely client-side: reads replicated Humanoid.Health, so it needs NO server changes and can't be exploited.
+-- Optional: if CombatService sets humanoid attribute "LastHitCrit" = true right before damaging, the number shows as a crit.
+-- Respects setting "Setting_DamageNumbers" (defaults on; SettingsController doesn't expose a toggle yet).
+-- NEEDS ART: font/colors/animation polish.
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local LP = Players.LocalPlayer
+
+local RANGE = 120
+local MIN_DELTA = 1 -- ignore regen ticks smaller than this
+local COLORS = {
+	Damage = Color3.fromRGB(255, 235, 220),
+	Crit = Color3.fromRGB(255, 170, 40),
+	Self = Color3.fromRGB(255, 70, 80),
+	Heal = Color3.fromRGB(110, 230, 130),
+}
+
+local tracked = setmetatable({}, { __mode = "k" })
+
+local function pop(adornee: BasePart, amount: number, kind: string)
+	if LP:GetAttribute("Setting_DamageNumbers") == false then return end
+	local cam = workspace.CurrentCamera
+	if not cam or (cam.CFrame.Position - adornee.Position).Magnitude > RANGE then return end
+	local bb = Instance.new("BillboardGui")
+	bb.Size = UDim2.fromOffset(120, 40)
+	bb.StudsOffset = Vector3.new((math.random() - 0.5) * 2.5, 2.5, 0)
+	bb.AlwaysOnTop = true
+	bb.Adornee = adornee
+	bb.Parent = LP.PlayerGui
+	local t = Instance.new("TextLabel")
+	t.Size = UDim2.fromScale(1, 1)
+	t.BackgroundTransparency = 1
+	t.Font = Enum.Font.GothamBlack
+	t.TextScaled = true
+	t.TextStrokeTransparency = 0.2
+	t.TextColor3 = COLORS[kind]
+	t.Text = (kind == "Heal" and "+" or "") .. tostring(math.floor(amount + 0.5)) .. (kind == "Crit" and "!" or "")
+	t.Parent = bb
+	if kind == "Crit" then bb.Size = UDim2.fromOffset(160, 54) end
+	local info = TweenInfo.new(0.9, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	TweenService:Create(bb, info, { StudsOffset = bb.StudsOffset + Vector3.new(0, 3, 0) }):Play()
+	TweenService:Create(t, info, { TextTransparency = 1, TextStrokeTransparency = 1 }):Play()
+	task.delay(0.95, function() bb:Destroy() end)
+end
+
+local function track(hum: Humanoid)
+	if tracked[hum] then return end
+	tracked[hum] = true
+	local last = hum.Health
+	hum.HealthChanged:Connect(function(h)
+		local delta = h - last
+		last = h
+		if math.abs(delta) < MIN_DELTA then return end
+		local model = hum.Parent
+		local part = model and (model:FindFirstChild("Head") or model:FindFirstChild("HumanoidRootPart"))
+		if not part or not part:IsA("BasePart") then return end
+		local kind
+		if delta > 0 then kind = "Heal"
+		elseif model == LP.Character then kind = "Self"
+		elseif hum:GetAttribute("LastHitCrit") then kind = "Crit"
+		else kind = "Damage" end
+		pop(part, math.abs(delta), kind)
+	end)
+end
+
+for _, d in workspace:GetDescendants() do if d:IsA("Humanoid") then track(d) end end
+workspace.DescendantAdded:Connect(function(d) if d:IsA("Humanoid") then track(d) end end)
