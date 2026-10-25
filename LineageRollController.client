@@ -1,0 +1,83 @@
+-- LineageRollController (LocalScript, StarterPlayerScripts)  -- key: L
+-- Shows current Lineage + spins and plays a slot-machine reveal. The RESULT is decided by the server
+-- (RollService); the spinning names are purely cosmetic and always land on the server's answer.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Remotes = require(ReplicatedStorage:WaitForChild("Remotes"))
+local UIKit = require(ReplicatedStorage:WaitForChild("UIKit"))
+local T = UIKit.Theme
+
+local TOGGLE_KEY = Enum.KeyCode.L -- ASSUMPTION: not used by CombatController
+
+-- Cosmetic name pool for the spin animation, read from LineageData (shape-tolerant)
+local namePool = {}
+do
+	local ok, LineageData = pcall(require, ReplicatedStorage:WaitForChild("LineageData", 5))
+	local src = ok and type(LineageData) == "table" and (LineageData.Lineages or LineageData) or {}
+	for id, def in src do
+		if type(def) == "table" then
+			table.insert(namePool, { Name = def.Name or tostring(id), Rarity = def.Rarity or "Common" })
+		end
+	end
+	if #namePool == 0 then namePool = { { Name = "???", Rarity = "Common" } } end
+end
+
+local gui = UIKit.Screen("LineageUI", 25)
+local panel, body = UIKit.Panel(gui, "Lineage", UDim2.fromOffset(380, 260))
+panel.Visible = false
+
+UIKit.Label(body, "CURRENT LINEAGE", UDim2.new(1, 0, 0, 16), nil, { TextColor3 = T.SubText, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Center })
+local nameLbl = UIKit.Label(body, "—", UDim2.new(1, 0, 0, 48), UDim2.fromOffset(0, 22),
+	{ Font = T.FontBold, TextSize = 32, TextXAlignment = Enum.TextXAlignment.Center })
+local rarityLbl = UIKit.Label(body, "", UDim2.new(1, 0, 0, 18), UDim2.fromOffset(0, 72), { TextXAlignment = Enum.TextXAlignment.Center, TextColor3 = T.SubText })
+local spinsLbl = UIKit.Label(body, "Spins: 0", UDim2.new(1, 0, 0, 18), UDim2.fromOffset(0, 100), { TextXAlignment = Enum.TextXAlignment.Center })
+local rollBtn = UIKit.Button(body, "ROLL", UDim2.new(0.6, 0, 0, 40), UDim2.new(0.2, 0, 0, 140))
+rollBtn.TextSize = 20
+UIKit.Label(body, "Rolling replaces your current Lineage.", UDim2.new(1, 0, 0, 16), UDim2.new(0, 0, 1, -18),
+	{ TextColor3 = T.Bad, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Center })
+
+local current = nil
+local rolling = false
+
+local function show(l)
+	if not l then return end
+	current = l
+	nameLbl.Text = l.Name or "None"
+	nameLbl.TextColor3 = UIKit.RarityColors[l.Rarity] or T.Text
+	rarityLbl.Text = l.Rarity or ""
+	spinsLbl.Text = "Spins: " .. tostring(l.Spins or 0)
+	rollBtn.AutoButtonColor = (l.Spins or 0) > 0
+	rollBtn.BackgroundColor3 = (l.Spins or 0) > 0 and T.Accent or T.AccentDim
+end
+
+local function spinTo(final)
+	-- Decelerating cycle (~2.2s). NEEDS POLISH: sound per tick (SoundData.RollTick), rarity flash/VFX on land.
+	local delay = 0.03
+	while delay < 0.25 do
+		local pick = namePool[math.random(1, #namePool)]
+		nameLbl.Text = pick.Name
+		nameLbl.TextColor3 = UIKit.RarityColors[pick.Rarity] or T.Text
+		task.wait(delay)
+		delay *= 1.12
+	end
+	show(final)
+	UIKit.Toast("Lineage: " .. final.Name .. " (" .. (final.Rarity or "?") .. ")", UIKit.RarityColors[final.Rarity] or T.Text, 4)
+end
+
+rollBtn.MouseButton1Click:Connect(function()
+	if rolling then return end
+	if current and (current.Spins or 0) <= 0 then UIKit.Toast("No spins left.", T.Bad) return end
+	rolling = true
+	rollBtn.Text = "..."
+	local res = Remotes.Function("RollLineage"):InvokeServer()
+	if res and res.Ok and res.Lineage then
+		spinTo(res.Lineage)
+	else
+		UIKit.Toast(res and res.Reason or "Roll failed", T.Bad)
+	end
+	rollBtn.Text = "ROLL"
+	rolling = false
+end)
+
+Remotes.Event("LineageSync").OnClientEvent:Connect(function(l) if not rolling then show(l) end end)
+UIKit.BindToggle(TOGGLE_KEY, panel, function() show(Remotes.Function("RequestSnapshot"):InvokeServer("Lineage")) end)
