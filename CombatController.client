@@ -1,0 +1,254 @@
+--!nonstrict
+--[[
+	CombatController  (StarterPlayer/StarterPlayerScripts/CombatController, LocalScript)
+	HEXBOUND - the client side of CombatService.
+
+	What this script does:
+	  * Sends input intent (M1 / BlockStart / BlockEnd). The server decides every outcome.
+	  * Applies server-issued knockback to the local character, which the client owns physically.
+	  * Plays animations from the replicated "CombatState" attribute and plays FX from CombatFX.
+
+	It makes no gameplay decisions. Animations are cosmetic and follow the server's state.
+	Replace the placeholder animation IDs with your own uploaded assets.
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local ContextActionService = game:GetService("ContextActionService")
+
+local player = Players.LocalPlayer
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+local CombatRequest = Remotes:WaitForChild("CombatRequest")
+local CombatFX = Remotes:WaitForChild("CombatFX")
+local KnockbackRemote = Remotes:WaitForChild("Knockback")
+
+----------------------------------------------------------------------
+-- Config (placeholders; replace with real asset IDs)
+----------------------------------------------------------------------
+local ANIMS = {
+	M1 = {
+		"rbxassetid://0", -- Strike1
+		"rbxassetid://0", -- Strike2
+		"rbxassetid://0", -- Strike3
+		"rbxassetid://0", -- Finisher
+	},
+	Block = "rbxassetid://0",
+	Hitstun = "rbxassetid://0",
+	ParryStunned = "rbxassetid://0",
+	GuardBroken = "rbxassetid://0",
+}
+
+local BLOCK_KEY = Enum.KeyCode.F
+local GAMEPAD_M1 = Enum.KeyCode.ButtonR2
+local GAMEPAD_BLOCK = Enum.KeyCode.ButtonL2
+
+-- Max magnitude accepted from the server. This guards against bad data, not exploiters (the server already decides the value).
+local MAX_KNOCKBACK = 200
+
+----------------------------------------------------------------------
+-- Animation cache per character
+----------------------------------------------------------------------
+local trackCache = {} -- [Animator] = { [id] = AnimationTrack }
+
+local function getTrack(animator: Animator, id: string): AnimationTrack?
+	if id == "rbxassetid://0" then return nil end -- placeholder, skip
+	trackCache[animator] = trackCache[animator] or {}
+	local cache = trackCache[animator]
+	if not cache[id] then
+		local anim = Instance.new("Animation")
+		anim.AnimationId = id
+		cache[id] = animator:LoadAnimation(anim)
+	end
+	return cache[id]
+end
+
+local function getAnimator(model: Model): Animator?
+	local hum = model and model:FindFirstChildOfClass("Humanoid")
+	return hum and hum:FindFirstChildOfClass("Animator")
+end
+
+local function stopLooping(animator: Animator)
+	local cache = trackCache[animator]
+	if not cache then return end
+	for id, track in pairs(cache) do
+		if id == ANIMS.Block or id == ANIMS.Hitstun or id == ANIMS.ParryStunned or id == ANIMS.GuardBroken then
+			track:Stop(0.1)
+		end
+	end
+end
+
+----------------------------------------------------------------------
+-- Input
+----------------------------------------------------------------------
+local blockHeld = false
+
+local function onM1(_, inputState)
+	if inputState == Enum.UserInputState.Begin then
+		CombatRequest:FireServer("M1")
+	end
+	return Enum.ContextActionResult.Pass
+end
+
+local function onBlock(_, inputState)
+	if inputState == Enum.UserInputState.Begin and not blockHeld then
+		blockHeld = true
+		CombatRequest:FireServer("BlockStart")
+	elseif (inputState == Enum.UserInputState.End or inputState == Enum.UserInputState.Cancel) and blockHeld then
+		blockHeld = false
+		CombatRequest:FireServer("BlockEnd")
+	end
+	return Enum.ContextActionResult.Sink
+end
+
+ContextActionService:BindAction("HexM1", onM1, false, Enum.UserInputType.MouseButton1, GAMEPAD_M1)
+ContextActionService:BindAction("HexBlock", onBlock, true, BLOCK_KEY, GAMEPAD_BLOCK)
+ContextActionService:SetTitle("HexBlock", "Block")
+
+-- Release block if the window loses focus, so the server isn't left thinking it's held
+UserInputService.WindowFocusReleased:Connect(function()
+	if blockHeld then
+		blockHeld = false
+		CombatRequest:FireServer("BlockEnd")
+	end
+end)
+
+----------------------------------------------------------------------
+-- Techniques (the client sends a slot number and aim; the server owns ids, costs and cooldowns)
+----------------------------------------------------------------------
+local TechniqueRequest = Remotes:WaitForChild("TechniqueRequest")
+local TechniqueFeedback = Remotes:WaitForChild("TechniqueFeedback")
+
+local TECH_KEYS = {
+	{ Enum.KeyCode.Z, Enum.KeyCode.ButtonX },
+	{ Enum.KeyCode.X, Enum.KeyCode.ButtonY },
+	{ Enum.KeyCode.C, Enum.KeyCode.ButtonB },
+	{ Enum.KeyCode.V, Enum.KeyCode.DPadUp },
+}
+
+for slot, keys in ipairs(TECH_KEYS) do
+	ContextActionService:BindAction("HexTech" .. slot, function(_, inputState)
+		if inputState ~= Enum.UserInputState.Begin then return Enum.ContextActionResult.Pass end
+		local cam = workspace.CurrentCamera
+		TechniqueRequest:FireServer(slot, cam and cam.CFrame.LookVector or nil)
+		return Enum.ContextActionResult.Sink
+	end, true, table.unpack(keys))
+end
+
+-- UI hook: the client keeps a local copy of loadout and cooldown state for a HUD to read
+local TechniqueState = { loadout = {}, readyAt = {} }
+TechniqueFeedback.OnClientEvent:Connect(function(kind, a, b)
+	if kind == "Loadout" and type(a) == "table" then
+		TechniqueState.loadout = a
+		TechniqueState.readyAt = {}
+		for slot, id in ipairs(a) do
+			ContextActionService:SetTitle("HexTech" .. slot, tostring(id))
+		end
+	elseif kind == "Cooldown" and type(a) == "string" and type(b) == "number" then
+		TechniqueState.readyAt[a] = os.clock() + b
+	elseif kind == "Denied" then
+		-- TODO: HUD shake / "Not enough Hex" toast. a = reason ("NoHex" | "Cooldown"), b = id
+	end
+end)
+
+----------------------------------------------------------------------
+-- Knockback (the server picks the vector; the client only applies it)
+----------------------------------------------------------------------
+KnockbackRemote.OnClientEvent:Connect(function(velocity, duration)
+	if typeof(velocity) ~= "Vector3" or type(duration) ~= "number" then return end
+	if velocity.Magnitude > MAX_KNOCKBACK then velocity = velocity.Unit * MAX_KNOCKBACK end
+	duration = math.clamp(duration, 0, 1)
+
+	local char = player.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not root then return end
+
+	local att = root:FindFirstChild("KnockbackAttachment") or Instance.new("Attachment")
+	att.Name = "KnockbackAttachment"
+	att.Parent = root
+
+	local lv = Instance.new("LinearVelocity")
+	lv.Attachment0 = att
+	lv.MaxForce = math.huge
+	lv.RelativeTo = Enum.ActuatorRelativeTo.World
+	lv.VectorVelocity = velocity
+	lv.Parent = root
+	task.delay(duration, function() lv:Destroy() end)
+end)
+
+----------------------------------------------------------------------
+-- State-driven animation (looping states)
+----------------------------------------------------------------------
+local LOOP_STATES = {
+	Blocking = ANIMS.Block,
+	Hitstun = ANIMS.Hitstun,
+	ParryStunned = ANIMS.ParryStunned,
+	GuardBroken = ANIMS.GuardBroken,
+}
+
+local watched = {} -- [Model] = RBXScriptConnection
+
+local function watchModel(model: Model)
+	if watched[model] then return end
+	local function refresh()
+		local animator = getAnimator(model)
+		if not animator then return end
+		stopLooping(animator)
+		local id = LOOP_STATES[model:GetAttribute("CombatState")]
+		local track = id and getTrack(animator, id)
+		if track then
+			track.Looped = true
+			track:Play(0.08)
+		end
+	end
+	watched[model] = model:GetAttributeChangedSignal("CombatState"):Connect(refresh)
+	model.AncestryChanged:Connect(function(_, parent)
+		if not parent and watched[model] then
+			watched[model]:Disconnect()
+			watched[model] = nil
+		end
+	end)
+	refresh()
+end
+
+-- Watch every character, plus any model that gets a CombatState later (NPCs)
+local function hookCharacter(char) watchModel(char) end
+for _, p in ipairs(Players:GetPlayers()) do
+	if p.Character then hookCharacter(p.Character) end
+	p.CharacterAdded:Connect(hookCharacter)
+end
+Players.PlayerAdded:Connect(function(p) p.CharacterAdded:Connect(hookCharacter) end)
+
+----------------------------------------------------------------------
+-- One-shot FX from the server
+----------------------------------------------------------------------
+local FXHandlers = {}
+
+function FXHandlers.M1(attacker: Model, index: number)
+	if typeof(attacker) ~= "Instance" or type(index) ~= "number" then return end
+	watchModel(attacker)
+	local animator = getAnimator(attacker)
+	local track = animator and ANIMS.M1[index] and getTrack(animator, ANIMS.M1[index])
+	if track then track:Play(0.05) end
+end
+
+local function flash(target: Model, color: Color3)
+	if typeof(target) ~= "Instance" then return end
+	watchModel(target)
+	local hl = Instance.new("Highlight")
+	hl.FillColor = color
+	hl.FillTransparency = 0.4
+	hl.OutlineTransparency = 1
+	hl.Parent = target
+	task.delay(0.12, function() hl:Destroy() end)
+end
+
+function FXHandlers.Hit(_, target) flash(target, Color3.fromRGB(255, 255, 255)) end
+function FXHandlers.Block(_, target) flash(target, Color3.fromRGB(120, 170, 255)) end
+function FXHandlers.Parry(_, defender) flash(defender, Color3.fromRGB(255, 215, 90)) end
+function FXHandlers.GuardBreak(_, target) flash(target, Color3.fromRGB(255, 70, 70)) end
+
+CombatFX.OnClientEvent:Connect(function(kind, ...)
+	local handler = type(kind) == "string" and FXHandlers[kind]
+	if handler then handler(...) end
+end)
