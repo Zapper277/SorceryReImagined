@@ -1,0 +1,345 @@
+-- ClientBridgeService (ModuleScript, ServerScriptService)
+-- Connects the new client UIs (inventory / missions / lineage roll / trade) to your EXISTING services.
+--
+-- !!! THIS IS THE ONLY FILE THAT GUESSES YOUR SERVICE APIs !!!
+-- Every call into your finished services goes through the ADAPTERS table below.
+-- If a name is wrong, you'll see a single warning in Output like:
+--   [ClientBridge] InventoryService:GetInventory missing - fix ADAPTERS.getInventory
+-- Fix it here and nothing else needs to change.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local Remotes = require(ReplicatedStorage:WaitForChild("Remotes"))
+
+local ClientBridgeService = {}
+
+---------------------------------------------------------------------------
+-- Helpers
+---------------------------------------------------------------------------
+local warned = {}
+local function getModule(container: Instance, name: string)
+	local m = container:FindFirstChild(name, true)
+	if m and m:IsA("ModuleScript") then
+		local ok, res = pcall(require, m)
+		if ok then return res end
+		warn("[ClientBridge] failed to require " .. name .. ": " .. tostring(res))
+	end
+	return nil
+end
+local function svc(name) return getModule(ServerScriptService, name) end
+local function shared(name) return getModule(ReplicatedStorage, name) end
+
+-- Try each "Service.Method" candidate in order; first that exists is called (method-style `:`).
+local function try(adapterName: string, candidates: { string }, ...)
+	for _, path in candidates do
+		local sName, mName = string.match(path, "^(%w+)%.(%w+)$")
+		local s = sName and svc(sName)
+		if s and type(s[mName]) == "function" then
+			local ok, a, b, c = pcall(s[mName], s, ...)
+			if not ok then warn(("[ClientBridge] %s errored: %s"):format(path, tostring(a))) return nil end
+			return a, b, c
+		end
+	end
+	if not warned[adapterName] then
+		warned[adapterName] = true
+		warn(("[ClientBridge] none of {%s} found - fix ADAPTERS.%s"):format(table.concat(candidates, ", "), adapterName))
+	end
+	return nil
+end
+
+-- ItemData / LineageData / MissionData can be shaped as `Data[id]` or `Data.Items[id]` etc.
+local function lookup(data, subKey: string, id)
+	if not data or id == nil then return nil end
+	if type(data[subKey]) == "table" and data[subKey][id] then return data[subKey][id] end
+	if type(data[id]) == "table" then return data[id] end
+	if type(data.Get) == "function" then
+		local ok, r = pcall(data.Get, data, id); if ok and r then return r end
+		ok, r = pcall(data.Get, id); if ok and r then return r end
+	end
+	return nil
+end
+
+---------------------------------------------------------------------------
+-- ADAPTERS  (ASSUMPTIONS - edit these to match your services)
+---------------------------------------------------------------------------
+local ADAPTERS = {}
+
+-- Inventory ---------------------------------------------------------------
+function ADAPTERS.getInventory(player)
+	local inv = try("getInventory", { "InventoryService.GetInventory", "InventoryService.Get" }, player)
+	if inv then return inv end
+	local data = try("getInventory(fallback)", { "PlayerDataService.GetData", "PlayerDataService.Get", "PlayerDataService.GetProfile" }, player)
+	return data and (data.Inventory or (data.Data and data.Data.Inventory)) or {}
+end
+function ADAPTERS.equip(player, uid)   return try("equip",   { "InventoryService.EquipItem", "InventoryService.Equip" }, player, uid) end
+function ADAPTERS.unequip(player, uid) return try("unequip", { "InventoryService.UnequipItem", "InventoryService.Unequip" }, player, uid) end
+function ADAPTERS.use(player, uid)     return try("use",     { "InventoryService.UseItem", "InventoryService.Use" }, player, uid) end
+function ADAPTERS.drop(player, uid)    return try("drop",    { "InventoryService.RemoveItem", "InventoryService.DropItem" }, player, uid, 1) end
+
+-- Missions ----------------------------------------------------------------
+function ADAPTERS.getActiveMissions(player)
+	return try("getActiveMissions", { "MissionService.GetActiveMissions", "MissionService.GetMissions" }, player) or {}
+end
+function ADAPTERS.getAvailableMissions(player)
+	return try("getAvailableMissions", { "MissionService.GetAvailableMissions" }, player)
+end
+function ADAPTERS.acceptMission(player, id)  return try("acceptMission",  { "MissionService.AcceptMission", "MissionService.StartMission" }, player, id) end
+function ADAPTERS.abandonMission(player, id) return try("abandonMission", { "MissionService.AbandonMission", "MissionService.CancelMission" }, player, id) end
+
+-- Lineage -----------------------------------------------------------------
+function ADAPTERS.getLineage(player)
+	local l = try("getLineage", { "RollService.GetLineage", "PlayerDataService.GetLineage" }, player)
+	if l then return l end
+	local data = try("getLineage(fallback)", { "PlayerDataService.GetData", "PlayerDataService.Get" }, player)
+	return data and data.Lineage
+end
+function ADAPTERS.getSpins(player)
+	local s = try("getSpins", { "RollService.GetSpins", "RollService.GetRolls" }, player)
+	if s then return s end
+	local data = try("getSpins(fallback)", { "PlayerDataService.GetData", "PlayerDataService.Get" }, player)
+	return data and (data.Spins or data.Rolls) or 0
+end
+function ADAPTERS.rollLineage(player)
+	-- Expected return: lineageId (string) OR table with .Id/.LineageId
+	return try("rollLineage", { "RollService.RollLineage", "RollService.Roll" }, player)
+end
+
+-- Trade -------------------------------------------------------------------
+function ADAPTERS.tradeRequest(a, b)        return try("tradeRequest", { "TradeService.RequestTrade", "TradeService.SendRequest" }, a, b) end
+function ADAPTERS.tradeAccept(b, a)         return try("tradeAccept",  { "TradeService.AcceptRequest", "TradeService.AcceptTrade" }, b, a) end
+function ADAPTERS.tradeAddItem(p, uid, qty) return try("tradeAddItem", { "TradeService.AddItem", "TradeService.OfferItem" }, p, uid, qty) end
+function ADAPTERS.tradeRemoveItem(p, uid)   return try("tradeRemoveItem", { "TradeService.RemoveItem" }, p, uid) end
+function ADAPTERS.tradeReady(p)             return try("tradeReady",   { "TradeService.SetReady", "TradeService.Lock" }, p, true) end
+function ADAPTERS.tradeConfirm(p)           return try("tradeConfirm", { "TradeService.Confirm", "TradeService.ConfirmTrade" }, p) end
+function ADAPTERS.tradeCancel(p)            return try("tradeCancel",  { "TradeService.Cancel", "TradeService.CancelTrade" }, p) end
+function ADAPTERS.tradeState(p)             return try("tradeState",   { "TradeService.GetTradeState", "TradeService.GetSession" }, p) end
+
+ClientBridgeService.Adapters = ADAPTERS
+
+---------------------------------------------------------------------------
+-- Normalizers: turn whatever shape your data uses into one shape for the client
+---------------------------------------------------------------------------
+local function normalizeInventory(raw)
+	local ItemData = shared("ItemData")
+	local out = {}
+	local function push(uid, itemId, qty, equipped)
+		local def = lookup(ItemData, "Items", itemId) or {}
+		table.insert(out, {
+			Uid = uid, ItemId = itemId, Quantity = qty or 1, Equipped = equipped == true,
+			Name = def.Name or def.DisplayName or tostring(itemId),
+			Rarity = def.Rarity or "Common",
+			Type = def.Type or def.Category or "Misc",
+			Description = def.Description or "",
+		})
+	end
+	if type(raw) ~= "table" then return out end
+	local items = raw.Items or raw.Slots or raw
+	for k, v in items do
+		if type(v) == "table" then
+			push(v.Uid or v.Id or v.Guid or k, v.ItemId or v.Id or k, v.Quantity or v.Amount or v.Count, v.Equipped)
+		elseif type(v) == "number" then -- { [itemId] = quantity }
+			push(k, k, v, false)
+		end
+	end
+	table.sort(out, function(a, b) return a.Name < b.Name end)
+	return out
+end
+
+local function normalizeMission(id, m, state)
+	local MissionData = shared("MissionData")
+	local def = lookup(MissionData, "Missions", id) or {}
+	local objectives = {}
+	local src = (type(m) == "table" and (m.Objectives or m.Progress)) or def.Objectives or {}
+	for i, o in src do
+		if type(o) == "table" then
+			table.insert(objectives, {
+				Text = o.Text or o.Description or o.Name or ("Objective " .. i),
+				Progress = o.Progress or o.Current or 0,
+				Goal = o.Goal or o.Required or o.Count or 1,
+			})
+		elseif type(o) == "number" then
+			local d = def.Objectives and def.Objectives[i] or {}
+			table.insert(objectives, { Text = d.Text or d.Description or ("Objective " .. i), Progress = o, Goal = d.Goal or d.Count or 1 })
+		end
+	end
+	return {
+		Id = id, State = state,
+		Name = def.Name or def.Title or tostring(id),
+		Description = def.Description or "",
+		Reward = def.RewardText or (def.Rewards and def.Rewards.XP and ("+" .. def.Rewards.XP .. " XP")) or "",
+		Objectives = objectives,
+	}
+end
+
+local function buildMissions(player)
+	local active, available = {}, {}
+	local activeIds = {}
+	for k, v in ADAPTERS.getActiveMissions(player) do
+		local id = (type(v) == "table" and (v.Id or v.MissionId)) or (type(k) == "string" and k) or v
+		activeIds[id] = true
+		table.insert(active, normalizeMission(id, v, "Active"))
+	end
+	local avail = ADAPTERS.getAvailableMissions(player)
+	if not avail then
+		-- Fallback: list everything in MissionData that isn't active.
+		local MissionData = shared("MissionData")
+		local list = MissionData and (MissionData.Missions or MissionData) or {}
+		avail = {}
+		for id, def in list do if type(def) == "table" and not activeIds[id] then table.insert(avail, id) end end
+	end
+	for k, v in avail do
+		local id = (type(v) == "table" and (v.Id or v.MissionId)) or (type(k) == "string" and k) or v
+		if not activeIds[id] then table.insert(available, normalizeMission(id, nil, "Available")) end
+	end
+	return { Active = active, Available = available }
+end
+
+local function buildLineage(player)
+	local LineageData = shared("LineageData")
+	local l = ADAPTERS.getLineage(player)
+	local id = type(l) == "table" and (l.Id or l.LineageId) or l
+	local def = lookup(LineageData, "Lineages", id) or {}
+	return { Id = id, Name = def.Name or (id and tostring(id)) or "None", Rarity = def.Rarity or "Common", Spins = ADAPTERS.getSpins(player) }
+end
+
+---------------------------------------------------------------------------
+-- Public push API - call these from your existing services when data changes
+-- (optional: the bridge also refreshes after every action it handles itself)
+---------------------------------------------------------------------------
+function ClientBridgeService.PushInventory(player: Player)
+	Remotes.Event("InventorySync"):FireClient(player, normalizeInventory(ADAPTERS.getInventory(player)))
+end
+function ClientBridgeService.PushMissions(player: Player)
+	Remotes.Event("MissionSync"):FireClient(player, buildMissions(player))
+end
+function ClientBridgeService.PushLineage(player: Player)
+	Remotes.Event("LineageSync"):FireClient(player, buildLineage(player))
+end
+function ClientBridgeService.PushTrade(player: Player, state: any?)
+	Remotes.Event("TradeUpdate"):FireClient(player, state or ADAPTERS.tradeState(player))
+end
+function ClientBridgeService.Notify(player: Player, text: string, kind: string?)
+	Remotes.Event("Notify"):FireClient(player, text, kind)
+end
+
+-- Effects: server tells nearby clients to play greybox VFX/SFX (keys from VFXData/SoundData)
+local EFFECT_RANGE = 250
+local function nearby(pos: Vector3)
+	local list = {}
+	for _, p in Players:GetPlayers() do
+		local hrp = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+		if hrp and (hrp.Position - pos).Magnitude <= EFFECT_RANGE then table.insert(list, p) end
+	end
+	return list
+end
+function ClientBridgeService.PlayVFX(key: string, cframe: CFrame, scale: number?)
+	for _, p in nearby(cframe.Position) do Remotes.Event("PlayVFX"):FireClient(p, key, cframe, scale) end
+end
+function ClientBridgeService.PlaySound(key: string, position: Vector3)
+	for _, p in nearby(position) do Remotes.Event("PlaySound"):FireClient(p, key, position) end
+end
+-- Call from DomainService when a domain opens (optional - DomainController also auto-detects, see that file)
+function ClientBridgeService.BroadcastDomain(caster: Player?, center: Vector3, radius: number, duration: number, lineageId: string?, color: Color3?)
+	Remotes.Event("DomainCast"):FireAllClients({
+		Caster = caster, Center = center, Radius = radius, Duration = duration, LineageId = lineageId, Color = color,
+	})
+end
+
+---------------------------------------------------------------------------
+-- Lifecycle
+---------------------------------------------------------------------------
+function ClientBridgeService.Init() Remotes.Event("Notify") end -- forces remote folder creation early
+
+function ClientBridgeService.Start()
+	Remotes.Function("RequestSnapshot").OnServerInvoke = function(player, what)
+		if not Remotes.RateLimit(player, "snapshot", 2, 6) then return nil end
+		if what == "Inventory" then return normalizeInventory(ADAPTERS.getInventory(player))
+		elseif what == "Missions" then return buildMissions(player)
+		elseif what == "Lineage" then return buildLineage(player)
+		elseif what == "Trade" then return ADAPTERS.tradeState(player) end
+		return nil
+	end
+
+	Remotes.Function("RollLineage").OnServerInvoke = function(player)
+		if not Remotes.RateLimit(player, "roll", 1, 1) then return { Ok = false, Reason = "Slow down" } end
+		local before = buildLineage(player)
+		if (before.Spins or 0) <= 0 then return { Ok = false, Reason = "No spins left" } end
+		local result = ADAPTERS.rollLineage(player)
+		if result == nil or result == false then return { Ok = false, Reason = "Roll failed" } end
+		local after = buildLineage(player)
+		return { Ok = true, Lineage = after }
+	end
+
+	Remotes.Event("InventoryAction").OnServerEvent:Connect(function(player, action, uid)
+		if not Remotes.RateLimit(player, "inv", 5, 8) then return end
+		if type(action) ~= "string" or uid == nil then return end
+		if action == "Equip" then ADAPTERS.equip(player, uid)
+		elseif action == "Unequip" then ADAPTERS.unequip(player, uid)
+		elseif action == "Use" then ADAPTERS.use(player, uid)
+		elseif action == "Drop" then ADAPTERS.drop(player, uid)
+		else return end
+		ClientBridgeService.PushInventory(player)
+	end)
+
+	Remotes.Event("MissionAction").OnServerEvent:Connect(function(player, action, id)
+		if not Remotes.RateLimit(player, "mission", 3, 5) then return end
+		if type(action) ~= "string" or id == nil then return end
+		if action == "Accept" then ADAPTERS.acceptMission(player, id)
+		elseif action == "Abandon" then ADAPTERS.abandonMission(player, id)
+		else return end
+		ClientBridgeService.PushMissions(player)
+	end)
+
+	Remotes.Event("TradeAction").OnServerEvent:Connect(function(player, action, arg, qty)
+		if not Remotes.RateLimit(player, "trade", 6, 10) then return end
+		if type(action) ~= "string" then return end
+		if action == "Request" then
+			local target = typeof(arg) == "Instance" and arg:IsA("Player") and arg or nil
+			if not target or target == player then return end
+			local ok = ADAPTERS.tradeRequest(player, target)
+			if ok ~= false then
+				Remotes.Event("TradeIncoming"):FireClient(target, player)
+				ClientBridgeService.Notify(player, "Trade request sent to " .. target.DisplayName)
+			end
+			return
+		elseif action == "Accept" then
+			local from = typeof(arg) == "Instance" and arg:IsA("Player") and arg or nil
+			if not from then return end
+			ADAPTERS.tradeAccept(player, from)
+			ClientBridgeService.PushTrade(from); ClientBridgeService.PushTrade(player)
+			return
+		elseif action == "Decline" then
+			local from = typeof(arg) == "Instance" and arg:IsA("Player") and arg or nil
+			if from then ClientBridgeService.Notify(from, player.DisplayName .. " declined your trade.", "Bad") end
+			return
+		elseif action == "Add" then ADAPTERS.tradeAddItem(player, arg, math.clamp(tonumber(qty) or 1, 1, 9999))
+		elseif action == "Remove" then ADAPTERS.tradeRemoveItem(player, arg)
+		elseif action == "Ready" then ADAPTERS.tradeReady(player)
+		elseif action == "Confirm" then ADAPTERS.tradeConfirm(player)
+		elseif action == "Cancel" then ADAPTERS.tradeCancel(player)
+		else return end
+		-- Push updated state to both sides (partner resolved from state if TradeService exposes it)
+		local state = ADAPTERS.tradeState(player)
+		ClientBridgeService.PushTrade(player, state)
+		local partner = type(state) == "table" and (state.Partner or state.Other)
+		if typeof(partner) == "Instance" and partner:IsA("Player") then ClientBridgeService.PushTrade(partner) end
+		if action == "Confirm" or action == "Cancel" then
+			ClientBridgeService.PushInventory(player)
+			if typeof(partner) == "Instance" then ClientBridgeService.PushInventory(partner) end
+		end
+	end)
+
+	local function onJoin(p)
+		task.delay(3, function() -- give PlayerDataService time to load the profile
+			if p.Parent then
+				ClientBridgeService.PushInventory(p); ClientBridgeService.PushMissions(p); ClientBridgeService.PushLineage(p)
+			end
+		end)
+	end
+	Players.PlayerAdded:Connect(onJoin)
+	for _, p in Players:GetPlayers() do onJoin(p) end
+end
+
+return ClientBridgeService
