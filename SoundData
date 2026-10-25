@@ -1,0 +1,22 @@
+-- SoundData (ModuleScript, ReplicatedStorage)
+-- ALL IDs ARE PLACEHOLDERS ("rbxassetid://0"). EffectsController skips them silently.
+-- NEEDS AUDIO: fill in IDs (Roblox Creator Store audio or your own uploads).
+
+local SoundData = {
+	Swing      = { Id = "rbxassetid://0", Volume = 0.6, PitchVariance = 0.1 },
+	Hit        = { Id = "rbxassetid://0", Volume = 0.8, PitchVariance = 0.1 },
+	HeavyHit   = { Id = "rbxassetid://0", Volume = 1.0, PitchVariance = 0.05 },
+	Block      = { Id = "rbxassetid://0", Volume = 0.7, PitchVariance = 0.1 },
+	Parry      = { Id = "rbxassetid://0", Volume = 1.0, PitchVariance = 0 },
+	GuardBreak = { Id = "rbxassetid://0", Volume = 1.0, PitchVariance = 0 },
+	HexCast    = { Id = "rbxassetid://0", Volume = 0.8, PitchVariance = 0.05 },
+	DomainOpen = { Id = "rbxassetid://0", Volume = 1.0, PitchVariance = 0 },
+	CurseRoar  = { Id = "rbxassetid://0", Volume = 0.9, PitchVariance = 0.15 },
+	LevelUp    = { Id = "rbxassetid://0", Volume = 0.8, PitchVariance = 0 },
+	RollTick   = { Id = "rbxassetid://0", Volume = 0.4, PitchVariance = 0 },
+	RollResult = { Id = "rbxassetid://0", Volume = 0.9, PitchVariance = 0 },
+	UIClick    = { Id = "rbxassetid://0", Volume = 0.4, PitchVariance = 0 },
+	Notify     = { Id = "rbxassetid://0", Volume = 0.5, PitchVariance = 0 },
+}
+
+return SoundData
