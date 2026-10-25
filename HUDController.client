@@ -1,0 +1,563 @@
+--!nonstrict
+--[[
+	HUDController  (StarterPlayer/StarterPlayerScripts/HUDController, LocalScript)
+	HEXBOUND - a functional greybox UI for every system: HUD bars, technique cooldowns, mission
+	tracker, mission board, Lineage roll, inventory/equipment, stat allocation, trading, and
+	Domain post-processing.
+
+	All of it is display and input only. Every button sends a request; the server decides.
+	The layout is deliberately plain so a UI artist can reskin it. Each panel is built by its own function.
+
+	Keys: G = Domain, B = Inventory (I is Roblox camera zoom), K = Stats, T = Trade, M = Abandon mission (while in one)
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local Lighting = game:GetService("Lighting")
+local RunService = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+local Shared = ReplicatedStorage:WaitForChild("Shared")
+local TechniqueData = require(Shared:WaitForChild("TechniqueData"))
+local LineageData = require(Shared:WaitForChild("LineageData"))
+local ItemData = require(Shared:WaitForChild("ItemData"))
+
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+local R = setmetatable({}, { __index = function(t, k) local r = Remotes:WaitForChild(k); rawset(t, k, r); return r end })
+
+----------------------------------------------------------------------
+-- UI helpers
+----------------------------------------------------------------------
+local gui = Instance.new("ScreenGui")
+gui.Name = "HexboundUI"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = false
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local FONT = Enum.Font.GothamMedium
+local BG = Color3.fromRGB(18, 16, 24)
+
+local function new(class, props, children)
+	local o = Instance.new(class)
+	for k, v in pairs(props or {}) do o[k] = v end
+	for _, c in ipairs(children or {}) do c.Parent = o end
+	return o
+end
+
+local function label(parent, text, props)
+	local l = new("TextLabel", { BackgroundTransparency = 1, Text = text, Font = FONT, TextSize = 14,
+		TextColor3 = Color3.new(1, 1, 1), TextXAlignment = Enum.TextXAlignment.Left, Size = UDim2.new(1, 0, 0, 18) })
+	for k, v in pairs(props or {}) do l[k] = v end
+	l.Parent = parent
+	return l
+end
+
+local function button(parent, text, onClick, props)
+	local b = new("TextButton", { Text = text, Font = FONT, TextSize = 14, TextColor3 = Color3.new(1, 1, 1),
+		BackgroundColor3 = Color3.fromRGB(60, 45, 90), AutoButtonColor = true, Size = UDim2.new(0, 120, 0, 28) },
+		{ new("UICorner", { CornerRadius = UDim.new(0, 6) }) })
+	for k, v in pairs(props or {}) do b[k] = v end
+	b.MouseButton1Click:Connect(onClick)
+	b.Parent = parent
+	return b
+end
+
+local function bar(parent, pos, size, color, name)
+	local frame = new("Frame", { Name = name, Position = pos, Size = size, BackgroundColor3 = Color3.fromRGB(30, 30, 35),
+		BorderSizePixel = 0, Parent = parent }, { new("UICorner", { CornerRadius = UDim.new(0, 4) }) })
+	local fill = new("Frame", { Name = "Fill", Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = color, BorderSizePixel = 0,
+		Parent = frame }, { new("UICorner", { CornerRadius = UDim.new(0, 4) }) })
+	local text = label(frame, "", { Size = UDim2.new(1, 0, 1, 0), TextXAlignment = Enum.TextXAlignment.Center, TextSize = 12 })
+	return function(v, max, txt)
+		fill.Size = UDim2.new(math.clamp(max > 0 and v / max or 0, 0, 1), 0, 1, 0)
+		text.Text = txt or ("%d / %d"):format(v, max)
+	end
+end
+
+local panels = {}
+local function panel(name, title, size)
+	local f = new("Frame", { Name = name, Size = size or UDim2.new(0, 420, 0, 380), Position = UDim2.new(0.5, 0, 0.5, 0),
+		AnchorPoint = Vector2.new(0.5, 0.5), BackgroundColor3 = BG, BackgroundTransparency = 0.05, Visible = false, Parent = gui },
+		{ new("UICorner", { CornerRadius = UDim.new(0, 10) }), new("UIStroke", { Color = Color3.fromRGB(120, 80, 200), Thickness = 1.5 }) })
+	label(f, title, { Position = UDim2.new(0, 14, 0, 8), TextSize = 18, Font = Enum.Font.GothamBold, Size = UDim2.new(1, -60, 0, 24) })
+	button(f, "X", function() f.Visible = false end, { Size = UDim2.new(0, 28, 0, 28), Position = UDim2.new(1, -36, 0, 6),
+		BackgroundColor3 = Color3.fromRGB(110, 40, 50) })
+	local body = new("ScrollingFrame", { Name = "Body", Position = UDim2.new(0, 10, 0, 40), Size = UDim2.new(1, -20, 1, -50),
+		BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 6, AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		CanvasSize = UDim2.new(), Parent = f }, { new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }) })
+	panels[name] = f
+	return f, body
+end
+
+local function clear(body)
+	for _, c in ipairs(body:GetChildren()) do if not c:IsA("UIListLayout") then c:Destroy() end end
+end
+
+local function row(parent, height)
+	return new("Frame", { Size = UDim2.new(1, -8, 0, height or 30), BackgroundTransparency = 1, Parent = parent },
+		{ new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6),
+			VerticalAlignment = Enum.VerticalAlignment.Center }) })
+end
+
+local toastLabel = label(gui, "", { Position = UDim2.new(0.5, -200, 0, 60), Size = UDim2.new(0, 400, 0, 28),
+	TextXAlignment = Enum.TextXAlignment.Center, TextSize = 18, TextStrokeTransparency = 0.4, Visible = false })
+local toastToken = 0
+local function toast(text, color)
+	toastToken += 1
+	local my = toastToken
+	toastLabel.Text = text
+	toastLabel.TextColor3 = color or Color3.new(1, 1, 1)
+	toastLabel.Visible = true
+	task.delay(2.5, function() if toastToken == my then toastLabel.Visible = false end end)
+end
+
+local REASONS = {
+	NoHex = "Not enough Hex", Cooldown = "On cooldown", Burnout = "Burned out",
+	HexNotFull = "Domain needs full Hex", LevelTooLow = "Level too low", NoSpins = "No spins left",
+	InMission = "Not during a mission", InTrade = "Not during a trade", Busy = "Busy",
+	LobbyFull = "Lobby full", ServerBusy = "All mission instances are busy", NotActionable = "Can't act right now",
+	AlreadyActive = "Domain already active", TargetIneligible = "That player can't trade", Declined = "Trade declined",
+	NotEnoughMarks = "Not enough Marks",
+}
+local function reasonText(r) return REASONS[r] or tostring(r) end
+
+----------------------------------------------------------------------
+-- HUD: health, Hex, guard, XP, info line
+----------------------------------------------------------------------
+local hud = new("Frame", { Name = "HUD", Position = UDim2.new(0, 16, 1, -130), Size = UDim2.new(0, 300, 0, 114),
+	BackgroundTransparency = 1, Parent = gui })
+local setHP = bar(hud, UDim2.new(0, 0, 0, 22), UDim2.new(1, 0, 0, 16), Color3.fromRGB(200, 60, 60), "HP")
+local setHex = bar(hud, UDim2.new(0, 0, 0, 42), UDim2.new(1, 0, 0, 16), Color3.fromRGB(140, 80, 255), "Hex")
+local setGuard = bar(hud, UDim2.new(0, 0, 0, 62), UDim2.new(0.6, 0, 0, 10), Color3.fromRGB(110, 170, 255), "Guard")
+local setXP = bar(hud, UDim2.new(0, 0, 0, 78), UDim2.new(1, 0, 0, 8), Color3.fromRGB(240, 200, 80), "XP")
+local infoLine = label(hud, "", { Position = UDim2.new(0, 0, 0, 0), TextSize = 15 })
+local stateLine = label(hud, "", { Position = UDim2.new(0, 0, 0, 92), TextSize = 12, TextColor3 = Color3.fromRGB(190, 190, 200) })
+
+-- Technique slots
+local techFrame = new("Frame", { Position = UDim2.new(0.5, -170, 1, -70), Size = UDim2.new(0, 340, 0, 56),
+	BackgroundTransparency = 1, Parent = gui }, { new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal,
+		Padding = UDim.new(0, 8), HorizontalAlignment = Enum.HorizontalAlignment.Center }) })
+local KEYS = { "Z", "X", "C", "V" }
+local techSlots = {}
+for i = 1, 4 do
+	local f = new("Frame", { Size = UDim2.new(0, 76, 0, 56), BackgroundColor3 = Color3.fromRGB(30, 26, 40), Parent = techFrame },
+		{ new("UICorner", { CornerRadius = UDim.new(0, 6) }) })
+	local cd = new("Frame", { Size = UDim2.new(1, 0, 0, 0), AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 0, 1, 0),
+		BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.4, BorderSizePixel = 0, Parent = f })
+	local name = label(f, "-", { Size = UDim2.new(1, -6, 0, 30), Position = UDim2.new(0, 3, 0, 4), TextWrapped = true,
+		TextSize = 11, TextXAlignment = Enum.TextXAlignment.Center })
+	local key = label(f, KEYS[i], { Size = UDim2.new(1, 0, 0, 16), Position = UDim2.new(0, 0, 1, -18), TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Center, TextColor3 = Color3.fromRGB(180, 160, 255) })
+	techSlots[i] = { frame = f, cd = cd, name = name, key = key, id = nil }
+end
+local techState = { readyAt = {}, durations = {} }
+
+R.TechniqueFeedback.OnClientEvent:Connect(function(kind, a, b)
+	if kind == "Loadout" and type(a) == "table" then
+		for i, slot in ipairs(techSlots) do
+			slot.id = a[i]
+			local def = a[i] and TechniqueData.Techniques[a[i]]
+			slot.name.Text = def and ("%s\n%d Hex"):format(def.name, def.hexCost) or "-"
+		end
+	elseif kind == "Cooldown" and type(b) == "number" then
+		techState.readyAt[a] = os.clock() + b
+		techState.durations[a] = b
+	elseif kind == "Denied" then
+		toast(reasonText(a), Color3.fromRGB(255, 120, 120))
+	end
+end)
+
+-- Mission tracker
+local tracker = new("Frame", { Position = UDim2.new(1, -296, 0, 80), Size = UDim2.new(0, 280, 0, 64),
+	BackgroundColor3 = BG, BackgroundTransparency = 0.25, Visible = false, Parent = gui },
+	{ new("UICorner", { CornerRadius = UDim.new(0, 8) }) })
+local trackerTitle = label(tracker, "", { Position = UDim2.new(0, 10, 0, 6), Font = Enum.Font.GothamBold })
+local trackerObj = label(tracker, "", { Position = UDim2.new(0, 10, 0, 24), TextSize = 13 })
+local trackerTime = label(tracker, "", { Position = UDim2.new(0, 10, 0, 42), TextSize = 12, TextColor3 = Color3.fromRGB(255, 210, 120) })
+local missionEndsAt = nil
+
+----------------------------------------------------------------------
+-- Per-frame HUD refresh
+----------------------------------------------------------------------
+RunService.RenderStepped:Connect(function()
+	local char = player.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if hum then setHP(math.floor(hum.Health), math.floor(hum.MaxHealth)) end
+	if char then
+		setHex(char:GetAttribute("Hex") or 0, char:GetAttribute("MaxHex") or 100,
+			char:GetAttribute("HexBurnout") and "BURNOUT" or nil)
+		setGuard(char:GetAttribute("Guard") or 100, 100, "")
+		local st = char:GetAttribute("CombatState") or "Idle"
+		local extra = {}
+		if char:GetAttribute("DomainActive") then table.insert(extra, "DOMAIN") end
+		if char:GetAttribute("DomainBurnout") then table.insert(extra, "Domain burnout") end
+		if char:GetAttribute("PvPEnabled") then table.insert(extra, "PvP") end
+		stateLine.Text = st .. (#extra > 0 and ("  |  " .. table.concat(extra, " | ")) or "")
+	end
+	setXP(player:GetAttribute("XP") or 0, player:GetAttribute("XPToNext") or 100, "")
+	local lin = LineageData.Lineages[player:GetAttribute("Lineage") or ""]
+	infoLine.Text = ("Lv %d  %s  |  %s  |  %d Marks  |  %d Spins"):format(player:GetAttribute("Level") or 1,
+		player:GetAttribute("Grade") or "", lin and lin.name or "?", player:GetAttribute("Marks") or 0, player:GetAttribute("Spins") or 0)
+
+	local now = os.clock()
+	for _, slot in ipairs(techSlots) do
+		local readyAt = slot.id and techState.readyAt[slot.id]
+		local dur = slot.id and techState.durations[slot.id]
+		if readyAt and dur and readyAt > now then
+			slot.cd.Size = UDim2.new(1, 0, (readyAt - now) / dur, 0)
+		else
+			slot.cd.Size = UDim2.new(1, 0, 0, 0)
+		end
+	end
+	if missionEndsAt then
+		local left = math.max(0, missionEndsAt - now)
+		trackerTime.Text = ("%d:%02d remaining"):format(left // 60, left % 60)
+	end
+end)
+
+----------------------------------------------------------------------
+-- Combat FX additions: Domain post-processing
+----------------------------------------------------------------------
+local cc = new("ColorCorrectionEffect", { Name = "DomainCC", Enabled = false, Parent = Lighting })
+local function refreshDomainFX()
+	local char = player.Character
+	local lineageId = char and char:GetAttribute("InDomain")
+	local lin = lineageId and LineageData.Lineages[lineageId]
+	if lin and lin.domain then
+		cc.Enabled = true
+		cc.TintColor = lin.domain.color:Lerp(Color3.new(1, 1, 1), 0.55)
+		cc.Contrast = 0.15
+		cc.Saturation = -0.2
+	else
+		cc.Enabled = false
+	end
+end
+player.CharacterAdded:Connect(function(char)
+	char:GetAttributeChangedSignal("InDomain"):Connect(refreshDomainFX)
+	refreshDomainFX()
+end)
+if player.Character then
+	player.Character:GetAttributeChangedSignal("InDomain"):Connect(refreshDomainFX)
+end
+R.CombatFX.OnClientEvent:Connect(function(kind, a, b, c)
+	if kind == "DomainStart" then
+		local lin = LineageData.Lineages[b]
+		if lin then toast(("Domain: %s"):format(lin.domain.name), lin.domain.color) end
+	elseif kind == "DomainClash" then
+		toast("DOMAIN CLASH!", Color3.fromRGB(255, 220, 120))
+	end
+end)
+
+----------------------------------------------------------------------
+-- Mission board / lobby / tracker
+----------------------------------------------------------------------
+local boardPanel, boardBody = panel("Board", "Mission Board", UDim2.new(0, 480, 0, 420))
+
+local function renderBoard(data)
+	clear(boardBody)
+	label(boardBody, "Open lobbies", { Font = Enum.Font.GothamBold })
+	if #data.lobbies == 0 then label(boardBody, "  none", { TextColor3 = Color3.fromRGB(150, 150, 150) }) end
+	for _, lob in ipairs(data.lobbies) do
+		local r = row(boardBody)
+		label(r, ("%s  (%d/4)  %ds"):format(lob.missionId, #lob.members, lob.launchesIn), { Size = UDim2.new(0, 300, 1, 0) })
+		button(r, "Join", function() R.MissionRequest:FireServer("Join", lob.host) end, { Size = UDim2.new(0, 80, 0, 26) })
+	end
+	label(boardBody, "Missions", { Font = Enum.Font.GothamBold })
+	for _, m in ipairs(data.missions) do
+		local r = row(boardBody, 40)
+		label(r, ("%s\n%s  •  Lv %d+  •  %d XP, %d Marks"):format(m.name, m.type, m.minLevel, m.rewards.xp, m.rewards.marks),
+			{ Size = UDim2.new(0, 330, 1, 0), TextSize = 12, TextWrapped = true })
+		button(r, "Host", function() R.MissionRequest:FireServer("Host", m.id) end, { Size = UDim2.new(0, 80, 0, 26) })
+	end
+	boardPanel.Visible = true
+end
+
+local lobbyFrame = new("Frame", { Position = UDim2.new(1, -296, 0, 150), Size = UDim2.new(0, 280, 0, 70),
+	BackgroundColor3 = BG, BackgroundTransparency = 0.25, Visible = false, Parent = gui }, { new("UICorner") })
+local lobbyText = label(lobbyFrame, "", { Position = UDim2.new(0, 10, 0, 4), Size = UDim2.new(1, -20, 0, 32), TextWrapped = true })
+button(lobbyFrame, "Launch", function() R.MissionRequest:FireServer("Launch") end,
+	{ Position = UDim2.new(0, 10, 1, -32), Size = UDim2.new(0, 100, 0, 26) })
+button(lobbyFrame, "Leave", function() R.MissionRequest:FireServer("Leave") end,
+	{ Position = UDim2.new(0, 120, 1, -32), Size = UDim2.new(0, 100, 0, 26), BackgroundColor3 = Color3.fromRGB(110, 40, 50) })
+
+R.MissionUpdate.OnClientEvent:Connect(function(event, payload)
+	if event == "OpenBoard" then
+		renderBoard(payload)
+	elseif event == "OpenRoll" then
+		panels.Roll.Visible = true
+	elseif event == "Lobby" then
+		if payload.closed then
+			lobbyFrame.Visible = false
+		else
+			lobbyFrame.Visible = true
+			lobbyText.Text = ("Lobby: %s\n%d member(s) • launching in %ds"):format(payload.missionId, #payload.members, payload.launchesIn)
+		end
+	elseif event == "Started" then
+		boardPanel.Visible = false
+		lobbyFrame.Visible = false
+		tracker.Visible = true
+		trackerTitle.Text = payload.missionId
+		missionEndsAt = os.clock() + payload.timeLimit
+	elseif event == "Objective" then
+		trackerObj.Text = payload.goal and ("%s  (%d/%d)"):format(payload.text, payload.progress, payload.goal) or payload.text
+	elseif event == "Ended" then
+		missionEndsAt = nil
+		tracker.Visible = false
+		if payload.success and payload.rewards then
+			local drops = {}
+			for _, d in ipairs(payload.rewards.drops or {}) do
+				local def = ItemData.Items[d.item]
+				table.insert(drops, ("%dx %s"):format(d.qty, def and def.name or d.item))
+			end
+			toast(("Mission complete! +%d XP, +%d Marks  %s"):format(payload.rewards.xp, payload.rewards.marks,
+				table.concat(drops, ", ")), Color3.fromRGB(140, 255, 160))
+		else
+			toast("Mission failed: " .. tostring(payload.reason), Color3.fromRGB(255, 120, 120))
+		end
+	elseif event == "Error" then
+		toast(reasonText(payload), Color3.fromRGB(255, 120, 120))
+	end
+end)
+
+----------------------------------------------------------------------
+-- Lineage roll
+----------------------------------------------------------------------
+local rollPanel, rollBody = panel("Roll", "Lineage Shrine", UDim2.new(0, 360, 0, 300))
+local rollResult = label(rollBody, "Roll to awaken a new Lineage.", { Size = UDim2.new(1, 0, 0, 60), TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Center, TextSize = 18 })
+local pityLabel = label(rollBody, "", { TextSize = 12, TextColor3 = Color3.fromRGB(180, 180, 190) })
+local rollBtn = button(rollBody, "Roll (1 Spin)", function() R.RollRequest:FireServer("Lineage") end,
+	{ Size = UDim2.new(1, -8, 0, 36) })
+local odds = {}
+for _, r in ipairs(LineageData.Rarities) do table.insert(odds, ("%s %.1f%%"):format(r.id, r.weight)) end
+label(rollBody, table.concat(odds, "  •  "), { TextSize = 11, TextWrapped = true, Size = UDim2.new(1, 0, 0, 30) })
+label(rollBody, ("Pity: Legendary at %d, Mythic at %d rolls"):format(LineageData.Pity.Legendary, LineageData.Pity.Mythic),
+	{ TextSize = 11 })
+
+R.RollResult.OnClientEvent:Connect(function(lineageId, rarityOrReason, spins, pity)
+	if pity then pityLabel.Text = ("Pity counters: Legendary %d • Mythic %d"):format(pity.Legendary or 0, pity.Mythic or 0) end
+	if not lineageId then
+		rollResult.Text = reasonText(rarityOrReason)
+		rollResult.TextColor3 = Color3.fromRGB(255, 120, 120)
+		return
+	end
+	-- Short suspense reveal (cosmetic only)
+	rollBtn.Active = false
+	for i = 1, 8 do
+		local r = LineageData.Rarities[(i % #LineageData.Rarities) + 1]
+		rollResult.Text = "..."
+		rollResult.TextColor3 = r.color
+		task.wait(0.08)
+	end
+	local lin = LineageData.Lineages[lineageId]
+	for _, r in ipairs(LineageData.Rarities) do if r.id == rarityOrReason then rollResult.TextColor3 = r.color end end
+	rollResult.Text = ("%s\n[%s]"):format(lin.name, rarityOrReason)
+	rollBtn.Active = true
+end)
+
+----------------------------------------------------------------------
+-- Inventory
+----------------------------------------------------------------------
+local invPanel, invBody = panel("Inventory", "Inventory", UDim2.new(0, 460, 0, 440))
+local inventory, equipped = {}, {}
+local tradeSelecting = nil -- set while picking items to offer in a trade
+
+local function renderInventory()
+	clear(invBody)
+	local eqText = {}
+	for _, slot in ipairs(ItemData.EquipSlots) do
+		local uid = equipped[slot]
+		local name = "empty"
+		for _, e in ipairs(inventory) do if e.uid == uid then name = ItemData.Items[e.id].name end end
+		local r = row(invBody)
+		label(r, ("%s: %s"):format(slot, name), { Size = UDim2.new(0, 300, 1, 0) })
+		if uid then button(r, "Unequip", function() R.InventoryRequest:FireServer("Unequip", slot) end, { Size = UDim2.new(0, 90, 0, 26) }) end
+		table.insert(eqText, slot)
+	end
+	label(invBody, ("Items (%d/%d)"):format(#inventory, ItemData.MaxInventorySlots), { Font = Enum.Font.GothamBold })
+	for _, e in ipairs(inventory) do
+		local def = ItemData.Items[e.id]
+		if def then
+			local r = row(invBody)
+			label(r, ("%s%s  [%s]"):format(def.name, e.qty > 1 and (" x" .. e.qty) or "", def.rarity),
+				{ Size = UDim2.new(0, 220, 1, 0), TextSize = 13 })
+			if tradeSelecting then
+				local on = tradeSelecting[e.uid]
+				button(r, on and "Remove" or "Offer", function()
+					tradeSelecting[e.uid] = not on or nil
+					renderInventory()
+				end, { Size = UDim2.new(0, 80, 0, 26) })
+			else
+				if def.type == "Consumable" then
+					button(r, "Use", function() R.InventoryRequest:FireServer("Use", e.uid) end, { Size = UDim2.new(0, 70, 0, 26) })
+				elseif def.type == "Accessory" then
+					button(r, "Equip", function() R.InventoryRequest:FireServer("Equip", e.uid) end, { Size = UDim2.new(0, 70, 0, 26) })
+				end
+				button(r, "Drop", function() R.InventoryRequest:FireServer("Discard", e.uid, 1) end,
+					{ Size = UDim2.new(0, 60, 0, 26), BackgroundColor3 = Color3.fromRGB(110, 40, 50) })
+			end
+		end
+	end
+end
+
+R.InventorySync.OnClientEvent:Connect(function(inv, eq)
+	inventory, equipped = inv or {}, eq or {}
+	if invPanel.Visible then renderInventory() end
+end)
+
+----------------------------------------------------------------------
+-- Stats
+----------------------------------------------------------------------
+local statPanel, statBody = panel("Stats", "Stats", UDim2.new(0, 340, 0, 260))
+local STAT_INFO = { Vitality = "+4 max HP", Strength = "+1% damage", HexControl = "+2 max Hex" }
+local function renderStats()
+	clear(statBody)
+	label(statBody, ("Unspent points: %d"):format(player:GetAttribute("StatPoints") or 0), { Font = Enum.Font.GothamBold })
+	for _, stat in ipairs({ "Vitality", "Strength", "HexControl" }) do
+		local r = row(statBody)
+		label(r, ("%s: %d  (%s)"):format(stat, player:GetAttribute("Stat_" .. stat) or 0, STAT_INFO[stat]),
+			{ Size = UDim2.new(0, 200, 1, 0), TextSize = 13 })
+		button(r, "+1", function() R.ProgressionRequest:FireServer("AllocateStat", stat, 1) end, { Size = UDim2.new(0, 40, 0, 26) })
+		button(r, "+5", function() R.ProgressionRequest:FireServer("AllocateStat", stat, 5) end, { Size = UDim2.new(0, 40, 0, 26) })
+	end
+end
+player.AttributeChanged:Connect(function(attr)
+	if statPanel.Visible and (attr == "StatPoints" or attr:sub(1, 5) == "Stat_") then renderStats() end
+end)
+
+----------------------------------------------------------------------
+-- Trade
+----------------------------------------------------------------------
+local tradePanel, tradeBody = panel("Trade", "Trade", UDim2.new(0, 480, 0, 440))
+local trade = { partner = nil, state = nil, marks = 0, countdown = nil }
+
+local function renderTrade()
+	clear(tradeBody)
+	if not trade.partner then
+		label(tradeBody, "Request a trade:", { Font = Enum.Font.GothamBold })
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p ~= player then
+				local r = row(tradeBody)
+				label(r, p.DisplayName, { Size = UDim2.new(0, 260, 1, 0) })
+				button(r, "Request", function() R.TradeRequest:FireServer("Request", p.UserId) end, { Size = UDim2.new(0, 90, 0, 26) })
+			end
+		end
+		return
+	end
+	local partner = Players:GetPlayerByUserId(trade.partner)
+	label(tradeBody, ("Trading with %s"):format(partner and partner.DisplayName or "?"), { Font = Enum.Font.GothamBold })
+	local function side(userId, title)
+		local s = trade.state and trade.state[tostring(userId)]
+		label(tradeBody, ("%s %s"):format(title, s and s.ready and "✔ READY" or ""), { Font = Enum.Font.GothamBold,
+			TextColor3 = s and s.ready and Color3.fromRGB(140, 255, 160) or Color3.new(1, 1, 1) })
+		if s then
+			for _, it in ipairs(s.offer.items) do
+				local def = ItemData.Items[it.id]
+				label(tradeBody, ("  • %s x%d"):format(def and def.name or it.id, it.qty), { TextSize = 13 })
+			end
+			label(tradeBody, ("  • %d Marks"):format(s.offer.marks), { TextSize = 13 })
+		end
+	end
+	side(player.UserId, "Your offer")
+	side(trade.partner, "Their offer")
+	if trade.countdown then label(tradeBody, ("Completing in %d..."):format(trade.countdown),
+		{ TextColor3 = Color3.fromRGB(255, 220, 120) }) end
+
+	local r = row(tradeBody)
+	button(r, "Pick items", function()
+		tradeSelecting = {}
+		local mine = trade.state and trade.state[tostring(player.UserId)]
+		if mine then for _, it in ipairs(mine.offer.items) do tradeSelecting[it.uid] = true end end
+		invPanel.Visible = true
+		renderInventory()
+	end, { Size = UDim2.new(0, 100, 0, 26) })
+	local marksBox = new("TextBox", { Size = UDim2.new(0, 90, 0, 26), Text = tostring(trade.marks), PlaceholderText = "Marks",
+		Font = FONT, TextSize = 14, BackgroundColor3 = Color3.fromRGB(40, 36, 50), TextColor3 = Color3.new(1, 1, 1), Parent = r })
+	button(r, "Update offer", function()
+		trade.marks = tonumber(marksBox.Text) or 0
+		local uids = {}
+		for uid in pairs(tradeSelecting or {}) do table.insert(uids, uid) end
+		if not tradeSelecting then
+			local mine = trade.state and trade.state[tostring(player.UserId)]
+			if mine then for _, it in ipairs(mine.offer.items) do table.insert(uids, it.uid) end end
+		end
+		tradeSelecting = nil
+		invPanel.Visible = false
+		R.TradeRequest:FireServer("SetOffer", uids, trade.marks)
+	end, { Size = UDim2.new(0, 110, 0, 26) })
+	local r2 = row(tradeBody)
+	local mine = trade.state and trade.state[tostring(player.UserId)]
+	button(r2, mine and mine.ready and "Unready" or "Ready", function()
+		R.TradeRequest:FireServer("Ready", not (mine and mine.ready))
+	end, { Size = UDim2.new(0, 110, 0, 28), BackgroundColor3 = Color3.fromRGB(50, 120, 70) })
+	button(r2, "Cancel", function() R.TradeRequest:FireServer("Cancel") end,
+		{ Size = UDim2.new(0, 110, 0, 28), BackgroundColor3 = Color3.fromRGB(110, 40, 50) })
+end
+
+-- Incoming request popup
+local incoming = new("Frame", { Position = UDim2.new(0.5, -160, 0, 100), Size = UDim2.new(0, 320, 0, 70), BackgroundColor3 = BG,
+	Visible = false, Parent = gui }, { new("UICorner") })
+local incomingText = label(incoming, "", { Position = UDim2.new(0, 10, 0, 4), Size = UDim2.new(1, -20, 0, 24) })
+local incomingFrom = nil
+button(incoming, "Accept", function()
+	incoming.Visible = false
+	if incomingFrom then R.TradeRequest:FireServer("Accept", incomingFrom) end
+end, { Position = UDim2.new(0, 10, 1, -34), Size = UDim2.new(0, 140, 0, 28), BackgroundColor3 = Color3.fromRGB(50, 120, 70) })
+button(incoming, "Decline", function()
+	incoming.Visible = false
+	if incomingFrom then R.TradeRequest:FireServer("Decline", incomingFrom) end
+end, { Position = UDim2.new(1, -150, 1, -34), Size = UDim2.new(0, 140, 0, 28), BackgroundColor3 = Color3.fromRGB(110, 40, 50) })
+
+R.TradeUpdate.OnClientEvent:Connect(function(event, payload)
+	if event == "Incoming" then
+		local from = Players:GetPlayerByUserId(payload)
+		incomingFrom = payload
+		incomingText.Text = ("%s wants to trade"):format(from and from.DisplayName or "Someone")
+		incoming.Visible = true
+		task.delay(30, function() if incomingFrom == payload then incoming.Visible = false end end)
+	elseif event == "Opened" then
+		trade.partner, trade.state, trade.countdown, trade.marks = payload, nil, nil, 0
+		tradePanel.Visible = true
+		renderTrade()
+	elseif event == "State" then
+		trade.state = payload
+		trade.countdown = nil
+		renderTrade()
+	elseif event == "Countdown" then
+		trade.countdown = payload
+		renderTrade()
+	elseif event == "Completed" then
+		toast("Trade complete", Color3.fromRGB(140, 255, 160))
+		trade.partner, trade.state, tradeSelecting = nil, nil, nil
+		tradePanel.Visible = false
+	elseif event == "Closed" then
+		toast("Trade closed: " .. tostring(payload), Color3.fromRGB(255, 180, 120))
+		trade.partner, trade.state, tradeSelecting = nil, nil, nil
+		tradePanel.Visible = false
+	elseif event == "Error" then
+		toast(reasonText(payload), Color3.fromRGB(255, 120, 120))
+	end
+end)
+
+----------------------------------------------------------------------
+-- Keybinds
+----------------------------------------------------------------------
+UserInputService.InputBegan:Connect(function(input, processed)
+	if processed then return end
+	local k = input.KeyCode
+	if k == Enum.KeyCode.G then
+		R.DomainRequest:FireServer()
+	elseif k == Enum.KeyCode.B then
+		invPanel.Visible = not invPanel.Visible
+		if invPanel.Visible then renderInventory() end
+	elseif k == Enum.KeyCode.K then
+		statPanel.Visible = not statPanel.Visible
+		if statPanel.Visible then renderStats() end
+	elseif k == Enum.KeyCode.T then
+		tradePanel.Visible = not tradePanel.Visible
+		if tradePanel.Visible then renderTrade() end
+	elseif k == Enum.KeyCode.M and player:GetAttribute("InMission") then
+		R.MissionRequest:FireServer("Leave")
+	end
+end)
