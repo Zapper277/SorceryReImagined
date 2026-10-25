@@ -1,0 +1,76 @@
+-- AnimationController (LocalScript, StarterPlayerScripts)
+-- Plays AnimationData animations on YOUR character (Roblox replicates your own character's animations
+-- to everyone automatically, so other players see them without server code).
+--
+-- Three ways animations get triggered:
+--  1) Direct call from CombatController (instant, client-predicted):
+--       _G.HexAnim.Play("M1_2")   /   _G.HexAnim.Stop("Block")
+--  2) Character attributes set by the SERVER (ASSUMPTION - names below; edit ATTRIBUTE_MAP to match
+--     what your CombatService actually sets). Bool attrs loop while true; others play once on change.
+--  3) Remote from server isn't needed - use (2).
+-- NEEDS ART: every ID in AnimationData is a placeholder, so nothing visible happens yet. This file is ready
+--   for when animations are uploaded (upload under the same account/group that owns the game!).
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local AnimationData = require(ReplicatedStorage:WaitForChild("AnimationData"))
+local LP = Players.LocalPlayer
+
+-- attribute name -> { anim key, mode }   mode: "Hold" = play while true, stop when false; "Once" = play on any change to truthy
+local ATTRIBUTE_MAP = {
+	Blocking  = { "Block", "Hold" },
+	Stunned   = { "Stun", "Hold" },
+	Knocked   = { "Knockdown", "Once" },
+	Parried   = { "Parry", "Once" },
+	Dashing   = { "Dash", "Once" },
+	Casting   = { "Cast_Area", "Once" },   -- CombatService/HexService may set this to a cast-type string instead
+}
+
+local animator: Animator? = nil
+local playing: { [string]: AnimationTrack } = {}
+
+local function play(key, fade)
+	if not animator then return nil end
+	local track = AnimationData.Play(animator, key, fade)
+	if track then playing[key] = track end
+	return track
+end
+
+local function stop(key, fade)
+	local t = playing[key]
+	if t then t:Stop(fade or 0.15); playing[key] = nil end
+end
+
+local function stopAll()
+	for k in playing do stop(k, 0.1) end
+end
+
+local function onCharacter(char)
+	stopAll()
+	local hum = char:WaitForChild("Humanoid", 10)
+	if not hum then return end
+	animator = hum:FindFirstChildOfClass("Animator") or hum:WaitForChild("Animator", 5)
+
+	for attr, cfg in ATTRIBUTE_MAP do
+		local key, mode = cfg[1], cfg[2]
+		char:GetAttributeChangedSignal(attr):Connect(function()
+			local v = char:GetAttribute(attr)
+			if mode == "Hold" then
+				if v then play(key) else stop(key) end
+			elseif v then
+				-- "Casting" can carry a cast type string like "Projectile" -> Cast_Projectile
+				if attr == "Casting" and type(v) == "string" and AnimationData.Anims["Cast_" .. v] then
+					play("Cast_" .. v)
+				else
+					play(key)
+				end
+			end
+		end)
+	end
+	hum.Died:Connect(stopAll)
+end
+
+LP.CharacterAdded:Connect(onCharacter)
+if LP.Character then task.spawn(onCharacter, LP.Character) end
+
+_G.HexAnim = { Play = play, Stop = stop, StopAll = stopAll }
