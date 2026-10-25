@@ -1,0 +1,60 @@
+-- AnimationData (ModuleScript, ReplicatedStorage)
+-- Central table of animation asset IDs. ALL ARE PLACEHOLDERS ("rbxassetid://0")
+-- until art is made. Get() returns nil for placeholders so callers can skip cleanly.
+-- NEEDS ART: every entry below.
+
+local AnimationData = {}
+
+AnimationData.Anims = {
+	-- Combat (keys meant to line up with CombatFrameData move names; rename to match yours)
+	M1_1 = { Id = "rbxassetid://0", Priority = Enum.AnimationPriority.Action, Speed = 1 },
+	M1_2 = { Id = "rbxassetid://0", Priority = Enum.AnimationPriority.Action, Speed = 1 },
+	M1_3 = { Id = "rbxassetid://0", Priority = Enum.AnimationPriority.Action, Speed = 1 },
+	M1_4 = { Id = "rbxassetid://0", Priority = Enum.AnimationPriority.Action, Speed = 1 },
+	Heavy = { Id = "rbxassetid://0", Priority = Enum.AnimationPriority.Action2, Speed = 1 },
+	Block = { Id = "rbxassetid://0", Priority = Enum.AnimationPriority.Action, Speed = 1, Looped = true },
+	Parry = { Id = "rbxassetid://0", Priority = Enum.AnimationPriority.Action2, Speed = 1 },
+	Dash = { Id = "rbxassetid://0", Priority = Enum.AnimationPriority.Action, Speed = 1 },
+	Stun = { Id = "rbxassetid://0", Priority = Enum.AnimationPriority.Action3, Speed = 1 },
+	Knockdown = { Id = "rbxassetid://0", Priority = Enum.AnimationPriority.Action4, Speed = 1 },
+
+	-- Hex techniques (generic per cast type; TechniqueData can override with its own key)
+	Cast_Projectile = { Id = "rbxassetid://0", Priority = Enum.AnimationPriority.Action2, Speed = 1 },
+	Cast_Area = { Id = "rbxassetid://0", Priority = Enum.AnimationPriority.Action2, Speed = 1 },
+	Cast_Self = { Id = "rbxassetid://0", Priority = Enum.AnimationPriority.Action2, Speed = 1 },
+	Domain_Expand = { Id = "rbxassetid://0", Priority = Enum.AnimationPriority.Action4, Speed = 1 },
+
+	-- Curses (CurseAI)
+	Curse_Attack = { Id = "rbxassetid://0", Priority = Enum.AnimationPriority.Action, Speed = 1 },
+	Curse_Death = { Id = "rbxassetid://0", Priority = Enum.AnimationPriority.Action4, Speed = 1 },
+}
+
+local PLACEHOLDER = "rbxassetid://0"
+
+function AnimationData.Get(key: string)
+	local a = AnimationData.Anims[key]
+	if not a or a.Id == PLACEHOLDER then return nil end
+	return a
+end
+
+-- Client helper: loads + caches tracks per Animator. Safe to call with placeholder keys (returns nil).
+local cache = setmetatable({}, { __mode = "k" })
+function AnimationData.Play(animator: Animator, key: string, fadeTime: number?)
+	local a = AnimationData.Get(key)
+	if not a or not animator then return nil end
+	local per = cache[animator]
+	if not per then per = {}; cache[animator] = per end
+	local track = per[key]
+	if not track then
+		local anim = Instance.new("Animation")
+		anim.AnimationId = a.Id
+		track = animator:LoadAnimation(anim)
+		track.Priority = a.Priority
+		track.Looped = a.Looped == true
+		per[key] = track
+	end
+	track:Play(fadeTime or 0.1, 1, a.Speed or 1)
+	return track
+end
+
+return AnimationData
