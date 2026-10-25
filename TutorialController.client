@@ -1,0 +1,119 @@
+-- TutorialController (LocalScript, StarterPlayerScripts)
+-- First-time onboarding: a step card at top-center that advances when the player does each thing.
+-- Only runs if the server says the tutorial isn't done. Has a Skip button (skipping forfeits the reward).
+--
+-- ASSUMPTIONS (step detection):
+--   * Attack = left mouse click / gamepad R2 while not over UI (CombatController handles the actual attack).
+--   * "Defeat a curse" is detected via a curse model with tag "Curse" whose Humanoid dies near the player.
+--     If CurseAI doesn't tag curses, that step won't complete - use the Skip button or tag them.
+-- NEEDS PLAYTESTING: step wording/order, and whether 1-4 dialogue keys conflict with technique keys.
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local CollectionService = game:GetService("CollectionService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Remotes = require(ReplicatedStorage:WaitForChild("Remotes"))
+local UIKit = require(ReplicatedStorage:WaitForChild("UIKit"))
+local Keybinds = require(ReplicatedStorage:WaitForChild("Keybinds"))
+local T = UIKit.Theme
+local LP = Players.LocalPlayer
+
+-- Each step: Text + a Watch(done) function that calls done() once when the condition is met.
+-- Returned connections are disconnected after the step completes.
+local STEPS = {
+	{ Text = "Move around with W A S D.", Watch = function(done)
+		local start = nil
+		return { game:GetService("RunService").Heartbeat:Connect(function()
+			local r = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+			if r and not start then start = r.Position end
+			if r and start and (r.Position - start).Magnitude > 15 then done() end
+		end) }
+	end },
+	{ Text = "Attack with Left Click.", Watch = function(done)
+		return { UserInputService.InputBegan:Connect(function(i, gp)
+			if not gp and (i.UserInputType == Enum.UserInputType.MouseButton1 or i.KeyCode == Enum.KeyCode.ButtonR2) then done() end
+		end) }
+	end },
+	{ Text = "Open your Inventory.", Key = "Inventory", Watch = function(done)
+		return { UserInputService.InputBegan:Connect(function(i, gp) if not gp and Keybinds.Is(i, "Inventory") then done() end end) }
+	end },
+	{ Text = "Check your Lineage.", Key = "Lineage", Watch = function(done)
+		return { UserInputService.InputBegan:Connect(function(i, gp) if not gp and Keybinds.Is(i, "Lineage") then done() end end) }
+	end },
+	{ Text = "Find The Archivist and press E to talk.", Watch = function(done)
+		return { Remotes.Event("DialogueShow").OnClientEvent:Connect(function(d) if d.NpcName == "The Archivist" then done() end end) }
+	end },
+	{ Text = "Open your Missions.", Key = "Missions", Watch = function(done)
+		return { UserInputService.InputBegan:Connect(function(i, gp) if not gp and Keybinds.Is(i, "Missions") then done() end end) }
+	end },
+	{ Text = "Defeat a curse.", Watch = function(done)
+		local conns = {}
+		local function hook(m)
+			local h = m:FindFirstChildOfClass("Humanoid")
+			if not h then return end
+			table.insert(conns, h.Died:Connect(function()
+				local r = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+				local mr = m:FindFirstChild("HumanoidRootPart")
+				if r and mr and (r.Position - mr.Position).Magnitude < 60 then done() end
+			end))
+		end
+		for _, m in CollectionService:GetTagged("Curse") do hook(m) end
+		table.insert(conns, CollectionService:GetInstanceAddedSignal("Curse"):Connect(hook))
+		return conns
+	end },
+}
+
+local state = Remotes.Function("GetTutorialState"):InvokeServer()
+if not state or state.Done then return end
+
+local gui = UIKit.Screen("TutorialUI", 33)
+local card = Instance.new("Frame")
+card.Size = UDim2.fromOffset(420, 74)
+card.Position = UDim2.new(0.5, 0, 0, 16)
+card.AnchorPoint = Vector2.new(0.5, 0)
+card.BackgroundColor3 = T.Bg
+card.BackgroundTransparency = 0.1
+card.BorderSizePixel = 0
+card.Parent = gui
+Instance.new("UICorner", card).CornerRadius = UDim.new(0, 8)
+local s = Instance.new("UIStroke"); s.Color = T.Accent; s.Thickness = 1.5; s.Parent = card
+local header = UIKit.Label(card, "", UDim2.new(1, -90, 0, 18), UDim2.fromOffset(12, 8), { TextColor3 = T.Accent, Font = T.FontBold, TextSize = 13 })
+local body = UIKit.Label(card, "", UDim2.new(1, -24, 0, 36), UDim2.fromOffset(12, 28), { TextSize = 17, Font = T.FontBold })
+local skip = UIKit.Button(card, "Skip", UDim2.fromOffset(64, 22), UDim2.new(1, -74, 0, 6))
+skip.TextSize = 12
+
+local stepIndex = state.Step or 0
+local active = {}
+
+local function clear() for _, c in active do c:Disconnect() end; table.clear(active) end
+
+local runStep
+runStep = function()
+	clear()
+	stepIndex += 1
+	local step = STEPS[stepIndex]
+	if not step then gui:Destroy() return end
+	header.Text = ("TUTORIAL  %d / %d"):format(stepIndex, #STEPS)
+	body.Text = step.Text
+	if step.Key then
+		local kc = Keybinds.Get(step.Key)
+		body.Text = step.Text .. (kc and ("  [" .. kc.Name .. "]") or "")
+	end
+	local finished = false
+	active = step.Watch(function()
+		if finished then return end
+		finished = true
+		Remotes.Event("TutorialStep"):FireServer(stepIndex)
+		UIKit.Toast("✓ " .. step.Text, T.Good, 2)
+		task.delay(0.6, runStep)
+	end) or {}
+end
+
+skip.MouseButton1Click:Connect(function()
+	clear()
+	Remotes.Event("TutorialStep"):FireServer(stepIndex, true)
+	UIKit.Toast("Tutorial skipped (no reward).", T.SubText)
+	gui:Destroy()
+end)
+
+runStep()
