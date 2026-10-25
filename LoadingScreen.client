@@ -1,0 +1,78 @@
+-- LoadingScreen (LocalScript, ReplicatedFirst)  -> put in ReplicatedFirst, NOT StarterPlayerScripts
+-- Replaces the default Roblox loading screen. Waits for the game to load AND for the server's remotes
+-- to exist (so UIs don't try to talk to a server that isn't ready), then fades out.
+-- NEEDS ART: logo, background art, loading tips. Text title is placeholder.
+
+local Players = game:GetService("Players")
+local ReplicatedFirst = game:GetService("ReplicatedFirst")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+
+ReplicatedFirst:RemoveDefaultLoadingScreen()
+
+local TIPS = {
+	"Parry right before a hit lands to stagger your attacker.",
+	"Hex regenerates faster out of combat.",
+	"Each Lineage unlocks its own Domain.",
+	"Press J to view your missions.",
+	"Curses grow stronger the longer they're left alone.",
+}
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "LoadingScreen"
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 1000
+gui.ResetOnSpawn = false
+gui.Parent = Players.LocalPlayer:WaitForChild("PlayerGui")
+
+local bg = Instance.new("Frame")
+bg.Size = UDim2.fromScale(1, 1)
+bg.BackgroundColor3 = Color3.fromRGB(8, 6, 12)
+bg.BorderSizePixel = 0
+bg.Parent = gui
+
+local function label(text, size, y, color, font)
+	local l = Instance.new("TextLabel")
+	l.Size = UDim2.new(1, 0, 0, size)
+	l.Position = UDim2.new(0, 0, y, 0)
+	l.BackgroundTransparency = 1
+	l.Text = text
+	l.TextSize = size
+	l.Font = font or Enum.Font.GothamBold
+	l.TextColor3 = color
+	l.Parent = bg
+	return l
+end
+
+local title = label("HEXBOUND", 64, 0.38, Color3.fromRGB(150, 70, 255))
+local status = label("Loading...", 18, 0.52, Color3.fromRGB(180, 170, 200), Enum.Font.Gotham)
+local tip = label(TIPS[math.random(1, #TIPS)], 14, 0.85, Color3.fromRGB(120, 110, 140), Enum.Font.Gotham)
+
+local barBg = Instance.new("Frame")
+barBg.Size = UDim2.new(0.3, 0, 0, 4); barBg.Position = UDim2.new(0.35, 0, 0.58, 0)
+barBg.BackgroundColor3 = Color3.fromRGB(30, 25, 40); barBg.BorderSizePixel = 0; barBg.Parent = bg
+local bar = Instance.new("Frame")
+bar.Size = UDim2.fromScale(0, 1); bar.BackgroundColor3 = Color3.fromRGB(150, 70, 255); bar.BorderSizePixel = 0; bar.Parent = barBg
+
+local function step(pct, text)
+	status.Text = text
+	TweenService:Create(bar, TweenInfo.new(0.3), { Size = UDim2.fromScale(pct, 1) }):Play()
+end
+
+step(0.15, "Loading assets...")
+if not game:IsLoaded() then game.Loaded:Wait() end
+step(0.5, "Connecting to server...")
+ReplicatedStorage:WaitForChild("HexUIRemotes", 30)
+step(0.8, "Summoning your character...")
+local LP = Players.LocalPlayer
+if not LP.Character then LP.CharacterAdded:Wait() end
+step(1, "Ready.")
+task.wait(0.4)
+
+local info = TweenInfo.new(0.8)
+TweenService:Create(bg, info, { BackgroundTransparency = 1 }):Play()
+for _, l in { title, status, tip } do TweenService:Create(l, info, { TextTransparency = 1 }):Play() end
+TweenService:Create(barBg, info, { BackgroundTransparency = 1 }):Play()
+TweenService:Create(bar, info, { BackgroundTransparency = 1 }):Play()
+task.wait(0.9)
+gui:Destroy()
