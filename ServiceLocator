@@ -1,0 +1,58 @@
+-- ServiceLocator (ModuleScript, ServerScriptService)
+-- Shared "call your existing service by name, with fallbacks" helper for the batch-3 services.
+-- Same idea as ClientBridgeService's adapters: if a guessed name is wrong you get ONE warning in Output
+-- naming the adapter, and you fix it in the file that owns that adapter.
+
+local ServerScriptService = game:GetService("ServerScriptService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local ServiceLocator = {}
+local warned = {}
+
+local function getModule(container, name)
+	local m = container:FindFirstChild(name, true)
+	if m and m:IsA("ModuleScript") then
+		local ok, r = pcall(require, m)
+		if ok then return r end
+		warn("[ServiceLocator] require failed: " .. name .. " - " .. tostring(r))
+	end
+	return nil
+end
+
+function ServiceLocator.Service(name) return getModule(ServerScriptService, name) end
+function ServiceLocator.Shared(name) return getModule(ReplicatedStorage, name) end
+
+-- ServiceLocator.Try("adapterLabel", {"Service.Method", ...}, args...) -> found:boolean, results...
+function ServiceLocator.Try(label: string, candidates: { string }, ...)
+	for _, path in candidates do
+		local s, m = string.match(path, "^(%w+)%.(%w+)$")
+		local mod = s and ServiceLocator.Service(s)
+		if mod and type(mod[m]) == "function" then
+			local ok, a, b, c = pcall(mod[m], mod, ...)
+			if not ok then warn(("[ServiceLocator] %s errored: %s"):format(path, tostring(a))) return true, nil end
+			return true, a, b, c
+		end
+	end
+	if not warned[label] then
+		warned[label] = true
+		warn(("[ServiceLocator] none of {%s} found - fix adapter '%s'"):format(table.concat(candidates, ", "), label))
+	end
+	return false, nil
+end
+
+-- Loads player save table via PlayerDataService (used for currency/settings fallbacks)
+function ServiceLocator.GetData(player)
+	local _, d = ServiceLocator.Try("GetData", { "PlayerDataService.GetData", "PlayerDataService.Get", "PlayerDataService.GetProfile" }, player)
+	if type(d) == "table" and type(d.Data) == "table" then return d.Data end -- ProfileService-style
+	return d
+end
+
+-- Shape-tolerant lookup for data modules: Data[sub][id] / Data[id] / Data:Get(id)
+function ServiceLocator.Lookup(data, subKey, id)
+	if not data or id == nil then return nil end
+	if type(data[subKey]) == "table" and data[subKey][id] then return data[subKey][id] end
+	if type(data[id]) == "table" then return data[id] end
+	return nil
+end
+
+return ServiceLocator
