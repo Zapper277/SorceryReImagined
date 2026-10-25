@@ -1,0 +1,287 @@
+--!nonstrict
+--[[
+	DomainService  (ServerScriptService/Services/DomainService)
+	HEXBOUND - Domains: your Lineage's ultimate. You create a sealed arena where you hold every advantage.
+
+	Requirements to cast (all checked on the server):
+	  * Your Lineage has a domain and you meet its minLevel.
+	  * Your Hex is FULL. Casting drains all of it (Drain, so it doesn't trigger Hex burnout).
+	  * You're actionable (Idle), no Domain is already active for you, and you're not in Domain burnout.
+
+	Cast:
+	  startup frames with SuperArmor (you take damage but aren't interrupted). Then the barrier forms:
+	  a ring of collidable walls plus a roof disc, which traps everyone inside for `duration` seconds.
+
+	While it's active:
+	  * Caster:  DomainDamageMult = casterDamageMult, plus casterHexRegen per second.
+	  * Enemies inside: DamageTakenMult = enemyDamageTakenMult, and a guaranteed hit (unblockable,
+	    unparryable) every pulse.interval seconds. This is the "sure-hit" effect.
+	  * "InDomain" attribute on everyone inside, for client post-processing (colour grading, vignette).
+
+	Clash: casting while an enemy's Domain overlaps yours starts a clash. Score = level
+	+ 5 × Lineage rarity tier + random(0..15). The loser's Domain collapses (if the new caster loses,
+	theirs never forms). Both casters' Hex is still used up.
+
+	Ending (time up, caster dies, or lost clash): the barrier is removed and all attributes restored.
+	The caster gets DOMAIN_BURNOUT seconds of TechniqueLocked (no techniques) and can't recast for DOMAIN_COOLDOWN.
+
+	Remote DomainRequest (C->S): no arguments.
+	CombatFX events: ("DomainStart", caster, lineageId, center, radius), ("DomainEnd", caster), ("DomainClash", a, b, winner)
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local LineageData = require(ReplicatedStorage.Shared.LineageData)
+local Services = ServerScriptService.Services
+local CombatService = require(Services.CombatService)
+local HexService = require(Services.HexService)
+local PlayerDataService = require(Services.PlayerDataService)
+
+local Remotes = ReplicatedStorage.Remotes
+local DomainRequest = Remotes:FindFirstChild("DomainRequest") or Instance.new("RemoteEvent")
+DomainRequest.Name = "DomainRequest"
+DomainRequest.Parent = Remotes
+local CombatFX = Remotes:WaitForChild("CombatFX")
+
+local DOMAIN_BURNOUT = 10
+local DOMAIN_COOLDOWN = 90
+local WALL_SEGMENTS = 28
+local WALL_HEIGHT = 40
+
+local DomainService = {}
+local activeDomains = {}  -- [casterModel] = domain
+local cooldownUntil = {}  -- [Player] = time
+local rng = Random.new()
+
+local function rootOf(model) return CombatService:GetRoot(model) end
+
+local function buildBarrier(center: Vector3, radius: number, color: Color3)
+	local folder = Instance.new("Folder")
+	folder.Name = "DomainBarrier"
+	local segLen = 2 * math.pi * radius / WALL_SEGMENTS + 1
+	for i = 0, WALL_SEGMENTS - 1 do
+		local a = (i / WALL_SEGMENTS) * math.pi * 2
+		local pos = center + Vector3.new(math.cos(a) * radius, WALL_HEIGHT / 2 - 3, math.sin(a) * radius)
+		local w = Instance.new("Part")
+		w.Anchored = true
+		w.Size = Vector3.new(segLen, WALL_HEIGHT, 2)
+		w.CFrame = CFrame.lookAt(pos, Vector3.new(center.X, pos.Y, center.Z))
+		w.Material = Enum.Material.ForceField
+		w.Color = color
+		w.Transparency = 0.15
+		w.Parent = folder
+	end
+	local roof = Instance.new("Part")
+	roof.Shape = Enum.PartType.Cylinder
+	roof.Anchored = true
+	roof.Size = Vector3.new(2, radius * 2 + 2, radius * 2 + 2)
+	roof.CFrame = CFrame.new(center + Vector3.new(0, WALL_HEIGHT - 3, 0)) * CFrame.Angles(0, 0, math.rad(90))
+	roof.Material = Enum.Material.ForceField
+	roof.Color = color
+	roof.Transparency = 0.3
+	roof.Parent = folder
+	local floor = roof:Clone()
+	floor.CanCollide = false
+	floor.Size = Vector3.new(0.2, radius * 2, radius * 2)
+	floor.CFrame = CFrame.new(center + Vector3.new(0, -2.9, 0)) * CFrame.Angles(0, 0, math.rad(90))
+	floor.Material = Enum.Material.Neon
+	floor.Transparency = 0.75
+	floor.Parent = folder
+	folder.Parent = workspace
+	return folder
+end
+
+local function entitiesInside(domain)
+	local list = {}
+	local params = OverlapParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { domain.barrier }
+	local seen = {}
+	for _, part in ipairs(workspace:GetPartBoundsInRadius(domain.center, domain.radius, params)) do
+		local model = part:FindFirstAncestorOfClass("Model")
+		if model and not seen[model] and rootOf(model) then
+			seen[model] = true
+			table.insert(list, model)
+		end
+	end
+	return list
+end
+
+local function isEnemy(caster, model)
+	if model == caster then return false end
+	local fa, fb = caster:GetAttribute("Faction"), model:GetAttribute("Faction")
+	if fa ~= nil and fa == fb then
+		return caster:GetAttribute("PvPEnabled") and model:GetAttribute("PvPEnabled")
+	end
+	return true
+end
+
+local function clashScore(model)
+	local player = Players:GetPlayerFromCharacter(model)
+	local data = player and PlayerDataService:GetProfile(player)
+	local level = data and data.level or 30
+	local lineage = data and LineageData.Lineages[data.lineage]
+	local tier = lineage and LineageData.rarityIndex(lineage.rarity) or 1
+	return level + tier * 5 + rng:NextNumber(0, 15)
+end
+
+----------------------------------------------------------------------
+function DomainService:EndDomain(caster, reason)
+	local d = activeDomains[caster]
+	if not d or d.ended then return end
+	d.ended = true
+	activeDomains[caster] = nil
+	if d.barrier then d.barrier:Destroy() end
+	for model in pairs(d.affected) do
+		if model.Parent then
+			model:SetAttribute("InDomain", nil)
+			if model ~= caster then model:SetAttribute("DamageTakenMult", nil) end
+		end
+	end
+	if caster.Parent then
+		caster:SetAttribute("DomainDamageMult", nil)
+		caster:SetAttribute("DomainActive", nil)
+		caster:SetAttribute("TechniqueLocked", true)
+		caster:SetAttribute("DomainBurnout", true)
+		task.delay(DOMAIN_BURNOUT, function()
+			if caster.Parent then
+				caster:SetAttribute("TechniqueLocked", nil)
+				caster:SetAttribute("DomainBurnout", nil)
+			end
+		end)
+	end
+	CombatFX:FireAllClients("DomainEnd", caster, reason)
+end
+
+local function runDomain(caster, lineageId, def)
+	local root = rootOf(caster)
+	if not root then return end
+	local center = root.Position
+
+	-- Clash with any overlapping enemy domain
+	for otherCaster, other in pairs(activeDomains) do
+		if otherCaster ~= caster and isEnemy(caster, otherCaster)
+			and (other.center - center).Magnitude < other.radius + def.radius then
+			local mine, theirs = clashScore(caster), clashScore(otherCaster)
+			local winner = mine >= theirs and caster or otherCaster
+			CombatFX:FireAllClients("DomainClash", caster, otherCaster, winner)
+			if winner == caster then
+				DomainService:EndDomain(otherCaster, "LostClash")
+			else
+				-- Ours never forms: treat it like it ended so burnout still applies
+				activeDomains[caster] = { ended = false, affected = {}, center = center, radius = def.radius }
+				DomainService:EndDomain(caster, "LostClash")
+				return
+			end
+		end
+	end
+
+	local domain = {
+		caster = caster, center = center, radius = def.radius, def = def, affected = {}, ended = false,
+		barrier = buildBarrier(center, def.radius, def.color),
+	}
+	activeDomains[caster] = domain
+	caster:SetAttribute("DomainActive", lineageId)
+	caster:SetAttribute("DomainDamageMult", def.casterDamageMult)
+	CombatFX:FireAllClients("DomainStart", caster, lineageId, center, def.radius)
+
+	local hum = caster:FindFirstChildOfClass("Humanoid")
+	local diedConn = hum.Died:Connect(function() DomainService:EndDomain(caster, "CasterDied") end)
+
+	local pulseHit = {
+		name = "DomainPulse", damage = def.pulse.damage, hitstun = def.pulse.hitstun, blockstun = 0,
+		guardDamage = 0, unblockable = true, unparryable = true, hexGain = 0,
+	}
+
+	local endsAt = os.clock() + def.duration
+	local nextPulse = os.clock() + def.pulse.interval
+	while not domain.ended and os.clock() < endsAt do
+		local dt = task.wait(0.25)
+		-- Refresh who's inside
+		local inside = {}
+		for _, model in ipairs(entitiesInside(domain)) do
+			inside[model] = true
+			if not domain.affected[model] then
+				domain.affected[model] = true
+				model:SetAttribute("InDomain", lineageId)
+				if isEnemy(caster, model) then model:SetAttribute("DamageTakenMult", def.enemyDamageTakenMult) end
+			end
+		end
+		for model in pairs(domain.affected) do
+			if not inside[model] and model.Parent then
+				-- Someone pushed out somehow (teleport, death): clear their attributes
+				domain.affected[model] = nil
+				model:SetAttribute("InDomain", nil)
+				if model ~= caster then model:SetAttribute("DamageTakenMult", nil) end
+			end
+		end
+
+		HexService:Gain(caster, def.casterHexRegen * dt, "Domain")
+
+		if os.clock() >= nextPulse then
+			nextPulse += def.pulse.interval
+			for model in pairs(inside) do
+				if isEnemy(caster, model) then
+					CombatService:ApplyHit(caster, model, pulseHit)
+				end
+			end
+		end
+	end
+	diedConn:Disconnect()
+	DomainService:EndDomain(caster, "Expired")
+end
+
+function DomainService:TryCast(player)
+	local char = player.Character
+	local data = PlayerDataService:GetProfile(player)
+	if not char or not data then return false, "NoCharacter" end
+	local lineage = LineageData.Lineages[data.lineage]
+	local def = lineage and lineage.domain
+	if not def then return false, "NoDomain" end
+	if data.level < def.minLevel then return false, "LevelTooLow" end
+	if activeDomains[char] then return false, "AlreadyActive" end
+	if char:GetAttribute("DomainBurnout") then return false, "Burnout" end
+	if os.clock() < (cooldownUntil[player] or 0) then return false, "Cooldown" end
+	local max = HexService:GetMax(char)
+	if HexService:Get(char) < max then return false, "HexNotFull" end
+
+	local started = CombatService:RunAction(char, {
+		startup = def.startup,
+		active = 1,
+		recovery = 20,
+		onActive = function(isValid)
+			char:SetAttribute("SuperArmor", nil)
+			char:SetAttribute("Invulnerable", nil)
+			if not isValid() then return end
+			task.spawn(runDomain, char, data.lineage, def)
+		end,
+	})
+	if not started then return false, "NotActionable" end
+
+	-- Startup is armored, so the cast can't be interrupted. You still take damage during it.
+	char:SetAttribute("SuperArmor", true)
+	HexService:Drain(char, max, "Domain")
+	cooldownUntil[player] = os.clock() + DOMAIN_COOLDOWN
+	CombatFX:FireAllClients("DomainCast", char, data.lineage)
+	return true
+end
+
+function DomainService:GetActive(model) return activeDomains[model] end
+
+function DomainService:Init()
+	DomainRequest.OnServerEvent:Connect(function(player)
+		local ok, reason = self:TryCast(player)
+		if not ok then
+			local fb = Remotes:FindFirstChild("TechniqueFeedback")
+			if fb then fb:FireClient(player, "Denied", reason, "Domain") end
+		end
+	end)
+	Players.PlayerRemoving:Connect(function(p)
+		if p.Character and activeDomains[p.Character] then self:EndDomain(p.Character, "Left") end
+		cooldownUntil[p] = nil
+	end)
+end
+
+return DomainService
