@@ -1,0 +1,119 @@
+-- MissionController (LocalScript, StarterPlayerScripts)  -- key: J
+-- Mission log (available + active) and an always-on objective tracker at top-right.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Remotes = require(ReplicatedStorage:WaitForChild("Remotes"))
+local UIKit = require(ReplicatedStorage:WaitForChild("UIKit"))
+local T = UIKit.Theme
+
+local TOGGLE_KEY = Enum.KeyCode.J -- ASSUMPTION: not used by CombatController
+
+local gui = UIKit.Screen("MissionUI", 15)
+local panel, body = UIKit.Panel(gui, "Missions", UDim2.fromOffset(520, 420))
+panel.Visible = false
+
+local tabActive = UIKit.Button(body, "Active", UDim2.new(0.5, -4, 0, 28))
+local tabAvail = UIKit.Button(body, "Available", UDim2.new(0.5, -4, 0, 28), UDim2.new(0.5, 4, 0, 0))
+local list = UIKit.Scroll(body, UDim2.new(1, 0, 1, -36), UDim2.fromOffset(0, 36), 6)
+
+-- Tracker (HUD-style, top-right). NOTE: positioned to avoid where most HUDs put HP/Hex (top-left/bottom).
+local tracker = Instance.new("Frame")
+tracker.Size = UDim2.fromOffset(260, 0)
+tracker.AutomaticSize = Enum.AutomaticSize.Y
+tracker.Position = UDim2.new(1, -16, 0, 80)
+tracker.AnchorPoint = Vector2.new(1, 0)
+tracker.BackgroundTransparency = 0.35
+tracker.BackgroundColor3 = T.Bg
+tracker.BorderSizePixel = 0
+tracker.Parent = gui
+Instance.new("UICorner", tracker).CornerRadius = UDim.new(0, 6)
+local tl = Instance.new("UIListLayout"); tl.Padding = UDim.new(0, 2); tl.Parent = tracker
+local tp = Instance.new("UIPadding"); tp.PaddingTop = UDim.new(0, 6); tp.PaddingBottom = UDim.new(0, 6); tp.PaddingLeft = UDim.new(0, 8); tp.Parent = tracker
+
+local state = { Active = {}, Available = {} }
+local tab = "Active"
+
+local function objectiveText(o)
+	local done = o.Progress >= o.Goal
+	return (done and "✓ " or "• ") .. o.Text .. (o.Goal > 1 and (" (%d/%d)"):format(math.min(o.Progress, o.Goal), o.Goal) or "")
+end
+
+local function renderTracker()
+	UIKit.Clear(tracker)
+	tracker.Visible = #state.Active > 0 and game:GetService("Players").LocalPlayer:GetAttribute("Setting_ShowTracker") ~= false
+	for i, m in state.Active do
+		if i > 3 then break end -- show max 3
+		UIKit.Label(tracker, m.Name, UDim2.new(1, -8, 0, 18), nil, { Font = T.FontBold, TextColor3 = T.Accent, LayoutOrder = i * 100 })
+		for j, o in m.Objectives do
+			UIKit.Label(tracker, objectiveText(o), UDim2.new(1, -8, 0, 16), nil,
+				{ TextSize = 13, TextColor3 = o.Progress >= o.Goal and T.Good or T.Text, LayoutOrder = i * 100 + j })
+		end
+	end
+end
+
+local function renderList()
+	tabActive.BackgroundColor3 = tab == "Active" and T.Accent or T.AccentDim
+	tabAvail.BackgroundColor3 = tab == "Available" and T.Accent or T.AccentDim
+	UIKit.Clear(list)
+	local missions = state[tab] or {}
+	if #missions == 0 then
+		UIKit.Label(list, tab == "Active" and "No active missions." or "Nothing available right now.", UDim2.new(1, 0, 0, 24), nil, { TextColor3 = T.SubText })
+	end
+	for i, m in missions do
+		local card = Instance.new("Frame")
+		card.Size = UDim2.new(1, 0, 0, 0)
+		card.AutomaticSize = Enum.AutomaticSize.Y
+		card.BackgroundColor3 = T.Panel
+		card.BorderSizePixel = 0
+		card.LayoutOrder = i
+		card.Parent = list
+		Instance.new("UICorner", card).CornerRadius = UDim.new(0, 6)
+		local l = Instance.new("UIListLayout"); l.Padding = UDim.new(0, 2); l.SortOrder = Enum.SortOrder.LayoutOrder; l.Parent = card
+		local p = Instance.new("UIPadding"); p.PaddingTop = UDim.new(0, 6); p.PaddingBottom = UDim.new(0, 6); p.PaddingLeft = UDim.new(0, 8); p.PaddingRight = UDim.new(0, 8); p.Parent = card
+
+		UIKit.Label(card, m.Name, UDim2.new(1, 0, 0, 20), nil, { Font = T.FontBold, TextSize = 16, LayoutOrder = 1 })
+		if m.Description ~= "" then
+			UIKit.Label(card, m.Description, UDim2.new(1, 0, 0, 0), nil, { AutomaticSize = Enum.AutomaticSize.Y, TextColor3 = T.SubText, TextSize = 13, LayoutOrder = 2 })
+		end
+		for j, o in m.Objectives do
+			UIKit.Label(card, objectiveText(o), UDim2.new(1, 0, 0, 16), nil, { TextSize = 13, LayoutOrder = 10 + j })
+		end
+		if m.Reward ~= "" then
+			UIKit.Label(card, "Reward: " .. m.Reward, UDim2.new(1, 0, 0, 16), nil, { TextSize = 13, TextColor3 = UIKit.RarityColors.Legendary, LayoutOrder = 50 })
+		end
+		local btn = UIKit.Button(card, m.State == "Active" and "Abandon" or "Accept", UDim2.fromOffset(110, 26))
+		btn.LayoutOrder = 60
+		btn.BackgroundColor3 = m.State == "Active" and T.Bad or T.Good
+		btn.MouseButton1Click:Connect(function()
+			Remotes.Event("MissionAction"):FireServer(m.State == "Active" and "Abandon" or "Accept", m.Id)
+		end)
+	end
+end
+
+local function apply(newState)
+	if not newState then return end
+	-- Toast when an objective completes
+	local old = {}
+	for _, m in state.Active do old[m.Id] = m end
+	for _, m in newState.Active or {} do
+		local prev = old[m.Id]
+		if prev then
+			for j, o in m.Objectives do
+				local po = prev.Objectives[j]
+				if po and po.Progress < po.Goal and o.Progress >= o.Goal then UIKit.Toast("Objective complete: " .. o.Text, T.Good) end
+			end
+		end
+	end
+	state = { Active = newState.Active or {}, Available = newState.Available or {} }
+	renderTracker(); renderList()
+end
+
+tabActive.MouseButton1Click:Connect(function() tab = "Active"; renderList() end)
+tabAvail.MouseButton1Click:Connect(function() tab = "Available"; renderList() end)
+
+Remotes.Event("MissionSync").OnClientEvent:Connect(apply)
+UIKit.BindToggle(TOGGLE_KEY, panel, function() apply(Remotes.Function("RequestSnapshot"):InvokeServer("Missions")) end)
+
+game:GetService("Players").LocalPlayer:GetAttributeChangedSignal("Setting_ShowTracker"):Connect(renderTracker)
+
+renderTracker(); renderList()
