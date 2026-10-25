@@ -1,0 +1,227 @@
+--!nonstrict
+--[[
+	HexService  (ServerScriptService/Services/HexService)
+	HEXBOUND - the server tracks the Hex meter for every combat entity (players and NPC curses).
+
+	Hex is gained mainly through fighting (landing hits, blocking, parrying), plus
+	slow passive regeneration out of combat. Techniques spend it through TrySpend.
+	The client never sends Hex values. It reads the replicated "Hex" / "MaxHex"
+	attributes for UI.
+
+	Public API:
+		HexService:Get(model) -> number
+		HexService:GetMax(model) -> number
+		HexService:CanSpend(model, amount) -> boolean
+		HexService:TrySpend(model, amount, reason?) -> boolean   -- deducts only if affordable
+		HexService:Gain(model, amount, reason?)
+		HexService:Drain(model, amount, reason?)                 -- forced loss, can't go below 0
+		HexService:SetMax(model, max)                            -- for ProgressionService / Lineages
+		HexService.Changed  (signal: model, newValue, delta, reason)
+		HexService.Depleted (signal: model)   -- hit 0 from spending -> Burnout
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local CombatService = require(ServerScriptService.Services.CombatService)
+
+----------------------------------------------------------------------
+-- Config (placeholder balance; tune here)
+----------------------------------------------------------------------
+local CONFIG = {
+	defaultMax = 100,
+	startingFraction = 0.5,       -- spawn with half Hex
+
+	regenPerSecond = 4,           -- passive regen only applies out of combat
+	combatTimeout = 4,            -- seconds since last dealing/taking a hit before counting as out of combat
+
+	burnoutDuration = 3,          -- spending down to 0 stops all Hex gain for this long
+	burnoutAttribute = "HexBurnout",
+
+	gains = {
+		hitLanded = 3,            -- attacker, per M1 hit
+		finisherLanded = 6,       -- attacker, M1 finisher
+		hitTaken = 1,             -- defender (small comeback gain)
+		blocked = 2,              -- defender, a successful block
+		parried = 15,             -- defender, rewards the timing skill
+	},
+	drains = {
+		guardBroken = 10,         -- defender loses Hex on guard break
+		parriedAttacker = 5,      -- attacker loses Hex when parried
+	},
+}
+
+----------------------------------------------------------------------
+local Signal = {}
+Signal.__index = Signal
+function Signal.new() return setmetatable({ _h = {} }, Signal) end
+function Signal:Connect(fn) table.insert(self._h, fn) end
+function Signal:Fire(...) for _, fn in ipairs(table.clone(self._h)) do task.spawn(fn, ...) end end
+
+local HexService = {}
+HexService.Changed = Signal.new()
+HexService.Depleted = Signal.new()
+
+local pools = {} -- [Model] = { value, max, lastCombatAt, burnoutUntil }
+local now = os.clock
+
+local function getPool(model)
+	if not model then return nil end
+	local p = pools[model]
+	if p then return p end
+	if not model:FindFirstChildOfClass("Humanoid") then return nil end
+
+	local max = CONFIG.defaultMax
+	p = { value = max * CONFIG.startingFraction, max = max, lastCombatAt = 0, burnoutUntil = 0 }
+	pools[model] = p
+	model:SetAttribute("MaxHex", max)
+	model:SetAttribute("Hex", math.floor(p.value))
+
+	model.AncestryChanged:Connect(function(_, parent)
+		if not parent then pools[model] = nil end
+	end)
+	return p
+end
+
+local function commit(model, p, newValue, reason)
+	newValue = math.clamp(newValue, 0, p.max)
+	local delta = newValue - p.value
+	if delta == 0 then return end
+	p.value = newValue
+	-- Only replicate whole numbers, so small regen ticks don't flood attribute updates
+	local shown = math.floor(newValue)
+	if model:GetAttribute("Hex") ~= shown then model:SetAttribute("Hex", shown) end
+	HexService.Changed:Fire(model, newValue, delta, reason)
+end
+
+local function inBurnout(p) return now() < p.burnoutUntil end
+
+----------------------------------------------------------------------
+-- Public API
+----------------------------------------------------------------------
+function HexService:Get(model): number
+	local p = getPool(model)
+	return p and p.value or 0
+end
+
+function HexService:GetMax(model): number
+	local p = getPool(model)
+	return p and p.max or 0
+end
+
+function HexService:CanSpend(model, amount: number): boolean
+	local p = getPool(model)
+	return p ~= nil and type(amount) == "number" and amount >= 0 and p.value >= amount
+end
+
+function HexService:TrySpend(model, amount: number, reason: string?): boolean
+	if not self:CanSpend(model, amount) then return false end
+	local p = pools[model]
+	commit(model, p, p.value - amount, reason or "Spend")
+	p.lastCombatAt = now()
+	if p.value <= 0 then
+		p.burnoutUntil = now() + CONFIG.burnoutDuration
+		model:SetAttribute(CONFIG.burnoutAttribute, true)
+		task.delay(CONFIG.burnoutDuration, function()
+			if pools[model] == p and not inBurnout(p) then
+				model:SetAttribute(CONFIG.burnoutAttribute, nil)
+			end
+		end)
+		self.Depleted:Fire(model)
+	end
+	return true
+end
+
+function HexService:Gain(model, amount: number, reason: string?)
+	local p = getPool(model)
+	if not p or type(amount) ~= "number" or amount <= 0 or inBurnout(p) then return end
+	commit(model, p, p.value + amount, reason or "Gain")
+end
+
+function HexService:Drain(model, amount: number, reason: string?)
+	local p = getPool(model)
+	if not p or type(amount) ~= "number" or amount <= 0 then return end
+	commit(model, p, p.value - amount, reason or "Drain")
+end
+
+function HexService:SetMax(model, max: number)
+	local p = getPool(model)
+	if not p or type(max) ~= "number" or max <= 0 then return end
+	p.max = max
+	model:SetAttribute("MaxHex", max)
+	commit(model, p, math.min(p.value, max), "SetMax")
+end
+
+----------------------------------------------------------------------
+-- Combat integration
+----------------------------------------------------------------------
+local function markCombat(...)
+	local t = now()
+	for _, m in ipairs({ ... }) do
+		local p = getPool(m)
+		if p then p.lastCombatAt = t end
+	end
+end
+
+local function hookCombat()
+	CombatService.HitLanded:Connect(function(attacker, target, hitData)
+		markCombat(attacker, target)
+		-- Techniques can set hexGain on their hitData to override the default; 0 means no gain.
+		local gain = hitData.hexGain
+		if gain == nil then
+			gain = (hitData.name == "Finisher") and CONFIG.gains.finisherLanded or CONFIG.gains.hitLanded
+		end
+		HexService:Gain(attacker, gain, "HitLanded")
+		HexService:Gain(target, CONFIG.gains.hitTaken, "HitTaken")
+	end)
+
+	CombatService.Blocked:Connect(function(attacker, target)
+		markCombat(attacker, target)
+		HexService:Gain(target, CONFIG.gains.blocked, "Blocked")
+	end)
+
+	CombatService.Parried:Connect(function(attacker, defender)
+		markCombat(attacker, defender)
+		HexService:Gain(defender, CONFIG.gains.parried, "Parry")
+		HexService:Drain(attacker, CONFIG.drains.parriedAttacker, "WasParried")
+	end)
+
+	CombatService.GuardBroken:Connect(function(attacker, target)
+		markCombat(attacker, target)
+		HexService:Drain(target, CONFIG.drains.guardBroken, "GuardBroken")
+	end)
+end
+
+----------------------------------------------------------------------
+-- Passive regen
+----------------------------------------------------------------------
+local function onHeartbeat(dt)
+	local t = now()
+	for model, p in pairs(pools) do
+		if p.value < p.max and not inBurnout(p) and t - p.lastCombatAt >= CONFIG.combatTimeout then
+			local hum = model:FindFirstChildOfClass("Humanoid")
+			if hum and hum.Health > 0 then
+				commit(model, p, p.value + CONFIG.regenPerSecond * dt, "Regen")
+			end
+		end
+	end
+end
+
+----------------------------------------------------------------------
+function HexService:Init()
+	hookCombat()
+	RunService.Heartbeat:Connect(onHeartbeat)
+
+	local function hookPlayer(player)
+		player.CharacterAdded:Connect(function(char)
+			char:WaitForChild("Humanoid")
+			getPool(char) -- a new character starts with a fresh pool (starting fraction)
+		end)
+		if player.Character then getPool(player.Character) end
+	end
+	Players.PlayerAdded:Connect(hookPlayer)
+	for _, p in ipairs(Players:GetPlayers()) do hookPlayer(p) end
+end
+
+return HexService
