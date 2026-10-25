@@ -1,0 +1,241 @@
+--!nonstrict
+--[[
+	InventoryService  (ServerScriptService/Services/InventoryService)
+	HEXBOUND - item ownership, stacking, consumables and equipment.
+
+	Inventory entries are { uid, id, qty }. Non-stackable items each get their own uid,
+	so trades and equips always refer to one specific instance.
+
+	Remote InventoryRequest:
+	  ("Use", uid)            -- use a consumable
+	  ("Equip", uid)          -- equip an accessory into its slot
+	  ("Unequip", slot)
+	  ("Discard", uid, qty)
+	Remote InventorySync (S->C): (inventoryArray, equippedMap), sent after every change.
+
+	API (server):
+	  AddItem(player, id, qty) -> added count (limited by slots and stack sizes)
+	  RemoveByUid(player, uid, qty) -> boolean
+	  CountItem(player, id) -> number
+	  GetEntry(player, uid) -> entry?
+	  Lock(player, uid, lockedBool)  -- TradeService locks offered items so they can't be used or equipped mid-trade
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+local HttpService = game:GetService("HttpService")
+
+local ItemData = require(ReplicatedStorage.Shared.ItemData)
+local Services = ServerScriptService.Services
+local PlayerDataService = require(Services.PlayerDataService)
+local ProgressionService = require(Services.ProgressionService)
+local HexService = require(Services.HexService)
+
+local Remotes = ReplicatedStorage.Remotes
+local function remote(name)
+	local r = Remotes:FindFirstChild(name) or Instance.new("RemoteEvent")
+	r.Name = name
+	r.Parent = Remotes
+	return r
+end
+local InventoryRequest = remote("InventoryRequest")
+local InventorySync = remote("InventorySync")
+
+local InventoryService = {}
+local locks = {}       -- [Player] = { [uid] = true }
+local lastRequest = {}
+
+local function profile(player) return PlayerDataService:GetProfile(player) end
+
+function InventoryService:Sync(player)
+	local data = profile(player)
+	if data then InventorySync:FireClient(player, data.inventory, data.equipped) end
+end
+
+function InventoryService:GetEntry(player, uid)
+	local data = profile(player)
+	if not data or type(uid) ~= "string" then return nil end
+	for i, e in ipairs(data.inventory) do
+		if e.uid == uid then return e, i end
+	end
+	return nil
+end
+
+function InventoryService:CountItem(player, id)
+	local data = profile(player)
+	local n = 0
+	if data then for _, e in ipairs(data.inventory) do if e.id == id then n += e.qty end end end
+	return n
+end
+
+function InventoryService:IsLocked(player, uid)
+	return locks[player] ~= nil and locks[player][uid] == true
+end
+
+function InventoryService:Lock(player, uid, locked)
+	locks[player] = locks[player] or {}
+	locks[player][uid] = locked or nil
+end
+
+function InventoryService:AddItem(player, id: string, qty: number?): number
+	local data = profile(player)
+	local def = ItemData.Items[id]
+	qty = math.floor(qty or 1)
+	if not data or not def or qty <= 0 then return 0 end
+
+	local added = 0
+	if def.stackable then
+		for _, e in ipairs(data.inventory) do
+			if added >= qty then break end
+			if e.id == id and e.qty < def.maxStack then
+				local n = math.min(def.maxStack - e.qty, qty - added)
+				e.qty += n
+				added += n
+			end
+		end
+	end
+	while added < qty and #data.inventory < ItemData.MaxInventorySlots do
+		local n = def.stackable and math.min(def.maxStack, qty - added) or 1
+		table.insert(data.inventory, { uid = HttpService:GenerateGUID(false), id = id, qty = n })
+		added += n
+	end
+	if added > 0 then
+		PlayerDataService:MarkDirty(player)
+		self:Sync(player)
+	end
+	return added
+end
+
+function InventoryService:RemoveByUid(player, uid: string, qty: number?): boolean
+	local data = profile(player)
+	local entry, index = self:GetEntry(player, uid)
+	qty = math.floor(qty or (entry and entry.qty) or 1)
+	if not data or not entry or qty <= 0 or entry.qty < qty then return false end
+	entry.qty -= qty
+	if entry.qty <= 0 then
+		table.remove(data.inventory, index)
+		for slot, eq in pairs(data.equipped) do
+			if eq == uid then data.equipped[slot] = nil end
+		end
+		self:Lock(player, uid, false)
+	end
+	PlayerDataService:MarkDirty(player)
+	self:Sync(player)
+	return true
+end
+
+-- Removes qty of an item id spread across stacks (for crafting / costs). All or nothing.
+function InventoryService:RemoveById(player, id: string, qty: number): boolean
+	if self:CountItem(player, id) < qty then return false end
+	local data = profile(player)
+	local remaining = qty
+	for i = #data.inventory, 1, -1 do
+		local e = data.inventory[i]
+		if e.id == id and remaining > 0 and not self:IsLocked(player, e.uid) then
+			local n = math.min(e.qty, remaining)
+			e.qty -= n
+			remaining -= n
+			if e.qty <= 0 then table.remove(data.inventory, i) end
+		end
+	end
+	PlayerDataService:MarkDirty(player)
+	self:Sync(player)
+	return remaining == 0
+end
+
+----------------------------------------------------------------------
+-- Consumables
+----------------------------------------------------------------------
+local EFFECTS = {}
+
+EFFECTS.AddSpins = function(player, data, effect)
+	data.spins += effect.amount
+	player:SetAttribute("Spins", data.spins)
+	return true
+end
+
+EFFECTS.RestoreHex = function(player, _, effect)
+	local char = player.Character
+	if not char or HexService:Get(char) >= HexService:GetMax(char) then return false end
+	HexService:Gain(char, effect.amount, "Item")
+	return true
+end
+
+EFFECTS.Heal = function(player, _, effect)
+	local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+	if not hum or hum.Health <= 0 or hum.Health >= hum.MaxHealth then return false end
+	hum.Health = math.min(hum.MaxHealth, hum.Health + effect.amount)
+	return true
+end
+
+EFFECTS.ResetStats = function(player)
+	ProgressionService:ResetStats(player)
+	return true
+end
+
+local function useItem(player, uid)
+	local data = profile(player)
+	local entry = InventoryService:GetEntry(player, uid)
+	if not entry or InventoryService:IsLocked(player, uid) then return end
+	local def = ItemData.Items[entry.id]
+	if not def or def.type ~= "Consumable" or not def.effect then return end
+	local fn = EFFECTS[def.effect.kind]
+	if fn and fn(player, data, def.effect) then
+		InventoryService:RemoveByUid(player, uid, 1)
+	end
+end
+
+----------------------------------------------------------------------
+-- Equipment
+----------------------------------------------------------------------
+local function equip(player, uid)
+	local data = profile(player)
+	local entry = InventoryService:GetEntry(player, uid)
+	if not entry or InventoryService:IsLocked(player, uid) then return end
+	local def = ItemData.Items[entry.id]
+	if not def or def.type ~= "Accessory" or not def.slot then return end
+	data.equipped[def.slot] = uid
+	PlayerDataService:MarkDirty(player)
+	ProgressionService:Apply(player)
+	InventoryService:Sync(player)
+end
+
+local function unequip(player, slot)
+	local data = profile(player)
+	if not data or type(slot) ~= "string" or data.equipped[slot] == nil then return end
+	data.equipped[slot] = nil
+	PlayerDataService:MarkDirty(player)
+	ProgressionService:Apply(player)
+	InventoryService:Sync(player)
+end
+
+----------------------------------------------------------------------
+local function onRequest(player, action, a, b)
+	local t = os.clock()
+	if t - (lastRequest[player] or 0) < 0.15 then return end
+	lastRequest[player] = t
+	if not profile(player) then return end
+
+	if action == "Use" and type(a) == "string" then
+		useItem(player, a)
+	elseif action == "Equip" and type(a) == "string" then
+		equip(player, a)
+	elseif action == "Unequip" then
+		unequip(player, a)
+	elseif action == "Discard" and type(a) == "string" then
+		if InventoryService:IsLocked(player, a) then return end
+		local entry = InventoryService:GetEntry(player, a)
+		if not entry then return end
+		local qty = (type(b) == "number" and b == b and b % 1 == 0) and b or entry.qty
+		InventoryService:RemoveByUid(player, a, math.clamp(qty, 1, entry.qty))
+	end
+end
+
+function InventoryService:Init()
+	InventoryRequest.OnServerEvent:Connect(onRequest)
+	PlayerDataService.ProfileLoaded:Connect(function(player) self:Sync(player) end)
+	Players.PlayerRemoving:Connect(function(p) locks[p] = nil; lastRequest[p] = nil end)
+end
+
+return InventoryService
