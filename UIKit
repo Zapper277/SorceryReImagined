@@ -1,0 +1,223 @@
+-- UIKit (ModuleScript, ReplicatedStorage)
+-- Tiny code-built UI helper so every new controller shares the same dark HEXBOUND look.
+-- NEEDS ART: this is functional greybox UI. Swap colors/fonts or replace with designed ScreenGuis later.
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+
+local UIKit = {}
+
+UIKit.Theme = {
+	Bg = Color3.fromRGB(14, 12, 20),
+	Panel = Color3.fromRGB(24, 20, 34),
+	Accent = Color3.fromRGB(140, 60, 255),
+	AccentDim = Color3.fromRGB(70, 35, 120),
+	Text = Color3.fromRGB(230, 225, 240),
+	SubText = Color3.fromRGB(150, 140, 170),
+	Good = Color3.fromRGB(90, 200, 120),
+	Bad = Color3.fromRGB(220, 70, 80),
+	Font = Enum.Font.GothamMedium,
+	FontBold = Enum.Font.GothamBold,
+}
+
+UIKit.RarityColors = {
+	Common = Color3.fromRGB(180, 180, 180),
+	Uncommon = Color3.fromRGB(90, 200, 120),
+	Rare = Color3.fromRGB(80, 140, 255),
+	Epic = Color3.fromRGB(170, 80, 255),
+	Legendary = Color3.fromRGB(255, 180, 40),
+	Mythic = Color3.fromRGB(255, 60, 90),
+}
+
+local T = UIKit.Theme
+
+local function corner(parent, r)
+	local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, r or 6); c.Parent = parent
+end
+
+function UIKit.Screen(name: string, order: number?)
+	local pg = Players.LocalPlayer:WaitForChild("PlayerGui")
+	local existing = pg:FindFirstChild(name)
+	if existing then existing:Destroy() end
+	local g = Instance.new("ScreenGui")
+	g.Name = name
+	g.ResetOnSpawn = false
+	g.IgnoreGuiInset = false
+	g.DisplayOrder = order or 10
+	g.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	-- Respect the UI Scale setting (SettingsController publishes Setting_UIScale)
+	local scale = Instance.new("UIScale")
+	local lp = Players.LocalPlayer
+	local function upd() local v = lp:GetAttribute("Setting_UIScale"); scale.Scale = type(v) == "number" and v or 1 end
+	upd()
+	lp:GetAttributeChangedSignal("Setting_UIScale"):Connect(upd)
+	scale.Parent = g
+	g.Parent = pg
+	return g
+end
+
+function UIKit.Panel(parent, title: string, size: UDim2, pos: UDim2?)
+	local f = Instance.new("Frame")
+	f.Name = title:gsub("%s", "")
+	f.Size = size
+	f.Position = pos or UDim2.fromScale(0.5, 0.5)
+	f.AnchorPoint = Vector2.new(0.5, 0.5)
+	f.BackgroundColor3 = T.Panel
+	f.BorderSizePixel = 0
+	f.Parent = parent
+	corner(f, 8)
+	local stroke = Instance.new("UIStroke"); stroke.Color = T.AccentDim; stroke.Thickness = 1.5; stroke.Parent = f
+
+	local bar = Instance.new("TextLabel")
+	bar.Name = "Title"
+	bar.Size = UDim2.new(1, 0, 0, 32)
+	bar.BackgroundColor3 = T.Bg
+	bar.BorderSizePixel = 0
+	bar.Text = "  " .. title:upper()
+	bar.TextXAlignment = Enum.TextXAlignment.Left
+	bar.Font = T.FontBold
+	bar.TextSize = 16
+	bar.TextColor3 = T.Accent
+	bar.Parent = f
+	corner(bar, 8)
+
+	local close = UIKit.Button(bar, "X", UDim2.fromOffset(28, 24), UDim2.new(1, -32, 0, 4))
+	close.BackgroundColor3 = T.Bad
+	close.MouseButton1Click:Connect(function() f.Visible = false end)
+
+	local body = Instance.new("Frame")
+	body.Name = "Body"
+	body.Size = UDim2.new(1, -16, 1, -44)
+	body.Position = UDim2.fromOffset(8, 38)
+	body.BackgroundTransparency = 1
+	body.Parent = f
+
+	UIKit.Draggable(f, bar)
+	return f, body
+end
+
+function UIKit.Label(parent, text: string, size: UDim2, pos: UDim2?, props: { [string]: any }?)
+	local l = Instance.new("TextLabel")
+	l.Size = size
+	l.Position = pos or UDim2.new()
+	l.BackgroundTransparency = 1
+	l.Text = text
+	l.Font = T.Font
+	l.TextSize = 14
+	l.TextColor3 = T.Text
+	l.TextXAlignment = Enum.TextXAlignment.Left
+	l.TextWrapped = true
+	if props then for k, v in props do (l :: any)[k] = v end end
+	l.Parent = parent
+	return l
+end
+
+function UIKit.Button(parent, text: string, size: UDim2, pos: UDim2?)
+	local b = Instance.new("TextButton")
+	b.Size = size
+	b.Position = pos or UDim2.new()
+	b.BackgroundColor3 = T.AccentDim
+	b.BorderSizePixel = 0
+	b.AutoButtonColor = true
+	b.Text = text
+	b.Font = T.FontBold
+	b.TextSize = 14
+	b.TextColor3 = T.Text
+	b.Parent = parent
+	corner(b, 6)
+	return b
+end
+
+function UIKit.Scroll(parent, size: UDim2, pos: UDim2?, padding: number?)
+	local s = Instance.new("ScrollingFrame")
+	s.Size = size
+	s.Position = pos or UDim2.new()
+	s.BackgroundColor3 = T.Bg
+	s.BorderSizePixel = 0
+	s.ScrollBarThickness = 6
+	s.ScrollBarImageColor3 = T.Accent
+	s.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	s.CanvasSize = UDim2.new()
+	s.Parent = parent
+	corner(s, 6)
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, padding or 4)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = s
+	local pad = Instance.new("UIPadding")
+	pad.PaddingTop = UDim.new(0, 4); pad.PaddingLeft = UDim.new(0, 4); pad.PaddingRight = UDim.new(0, 8)
+	pad.Parent = s
+	return s
+end
+
+function UIKit.Clear(container)
+	for _, c in container:GetChildren() do
+		if c:IsA("GuiObject") then c:Destroy() end
+	end
+end
+
+function UIKit.Draggable(frame: GuiObject, handle: GuiObject)
+	local dragging, startPos, startInput = false, nil, nil
+	handle.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true; startPos = frame.Position; startInput = input.Position
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then dragging = false end
+			end)
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local d = input.Position - startInput
+			frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end)
+end
+
+-- Toggle a panel with a key. Ignores input while typing in chat/textboxes.
+-- Remappable: if keyCode is a Keybinds default, the player's custom binding for that action is used instead.
+function UIKit.BindToggle(keyCode: Enum.KeyCode, frame: GuiObject, onOpen: (() -> ())?)
+	local Keybinds = require(script.Parent:WaitForChild("Keybinds"))
+	local action = Keybinds.ActionForDefault(keyCode)
+	UserInputService.InputBegan:Connect(function(input, processed)
+		if processed or UserInputService:GetFocusedTextBox() then return end
+		if UIKit.Capturing then return end -- SettingsController is waiting for a new key
+		local match = if action then Keybinds.Is(input, action) else input.KeyCode == keyCode
+		if match then
+			frame.Visible = not frame.Visible
+			if frame.Visible and onOpen then onOpen() end
+		end
+	end)
+end
+
+-- Toast notifications (bottom-center stack)
+local toastGui
+function UIKit.Toast(text: string, color: Color3?, duration: number?)
+	if not toastGui or not toastGui.Parent then
+		toastGui = UIKit.Screen("HexToasts", 50)
+		local holder = Instance.new("Frame")
+		holder.Name = "Holder"
+		holder.Size = UDim2.new(0, 360, 0, 300)
+		holder.Position = UDim2.new(0.5, 0, 1, -140)
+		holder.AnchorPoint = Vector2.new(0.5, 1)
+		holder.BackgroundTransparency = 1
+		holder.Parent = toastGui
+		local l = Instance.new("UIListLayout")
+		l.VerticalAlignment = Enum.VerticalAlignment.Bottom
+		l.Padding = UDim.new(0, 4)
+		l.Parent = holder
+	end
+	local holder = toastGui.Holder
+	local lbl = UIKit.Label(holder, text, UDim2.new(1, 0, 0, 30), nil, {
+		BackgroundTransparency = 0.15, BackgroundColor3 = T.Bg,
+		TextXAlignment = Enum.TextXAlignment.Center, TextColor3 = color or T.Text, Font = T.FontBold,
+	})
+	corner(lbl, 6)
+	task.delay(duration or 3, function()
+		local tw = TweenService:Create(lbl, TweenInfo.new(0.3), { TextTransparency = 1, BackgroundTransparency = 1 })
+		tw:Play(); tw.Completed:Wait(); lbl:Destroy()
+	end)
+end
+
+return UIKit
