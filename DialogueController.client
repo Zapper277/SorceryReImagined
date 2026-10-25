@@ -1,0 +1,90 @@
+-- DialogueController (LocalScript, StarterPlayerScripts)
+-- Bottom-of-screen dialogue box with typewriter text + numbered choices (click or press 1-4).
+-- The server decides what happens; this only displays nodes and sends the chosen index.
+-- NEEDS ART: NPC portraits, voice blips (SoundData.UIClick used as placeholder).
+
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Remotes = require(ReplicatedStorage:WaitForChild("Remotes"))
+local UIKit = require(ReplicatedStorage:WaitForChild("UIKit"))
+local T = UIKit.Theme
+
+local gui = UIKit.Screen("DialogueUI", 35)
+local box = Instance.new("Frame")
+box.Size = UDim2.new(0.6, 0, 0, 200)
+box.Position = UDim2.new(0.5, 0, 1, -24)
+box.AnchorPoint = Vector2.new(0.5, 1)
+box.BackgroundColor3 = T.Bg
+box.BackgroundTransparency = 0.1
+box.BorderSizePixel = 0
+box.Visible = false
+box.Parent = gui
+Instance.new("UICorner", box).CornerRadius = UDim.new(0, 8)
+local st = Instance.new("UIStroke"); st.Color = T.AccentDim; st.Thickness = 1.5; st.Parent = box
+
+local nameLbl = UIKit.Label(box, "", UDim2.new(1, -24, 0, 22), UDim2.fromOffset(12, 8), { Font = T.FontBold, TextSize = 18, TextColor3 = T.Accent })
+local titleLbl = UIKit.Label(box, "", UDim2.new(1, -24, 0, 14), UDim2.fromOffset(12, 30), { TextSize = 12, TextColor3 = T.SubText })
+local textLbl = UIKit.Label(box, "", UDim2.new(1, -24, 0, 60), UDim2.fromOffset(12, 48), { TextSize = 16, TextYAlignment = Enum.TextYAlignment.Top })
+local choiceHolder = Instance.new("Frame")
+choiceHolder.Size = UDim2.new(1, -24, 0, 80)
+choiceHolder.Position = UDim2.new(0, 12, 1, -88)
+choiceHolder.BackgroundTransparency = 1
+choiceHolder.Parent = box
+local grid = Instance.new("UIGridLayout")
+grid.CellSize = UDim2.new(0.5, -4, 0, 36); grid.CellPadding = UDim2.fromOffset(8, 6); grid.SortOrder = Enum.SortOrder.LayoutOrder
+grid.Parent = choiceHolder
+
+local currentChoices = 0
+local typingId = 0
+local awaiting = false
+
+local function choose(i)
+	if not box.Visible or awaiting or i < 1 or i > currentChoices then return end
+	awaiting = true -- prevents double-sends while the server responds
+	Remotes.Event("DialogueChoice"):FireServer(i)
+end
+
+Remotes.Event("DialogueShow").OnClientEvent:Connect(function(data)
+	awaiting = false
+	box.Visible = true
+	nameLbl.Text = data.NpcName or ""
+	titleLbl.Text = data.Title or ""
+	UIKit.Clear(choiceHolder)
+	currentChoices = #data.Choices
+	for i, text in data.Choices do
+		local b = UIKit.Button(choiceHolder, ("[%d] %s"):format(i, text), UDim2.new())
+		b.LayoutOrder = i
+		b.TextXAlignment = Enum.TextXAlignment.Left
+		b.MouseButton1Click:Connect(function() choose(i) end)
+	end
+	-- typewriter
+	typingId += 1
+	local my = typingId
+	local full = data.Text or ""
+	textLbl.Text = full
+	textLbl.MaxVisibleGraphemes = 0
+	task.spawn(function()
+		for n = 1, utf8.len(full) or #full do
+			if typingId ~= my then return end
+			textLbl.MaxVisibleGraphemes = n
+			task.wait(0.015)
+		end
+		textLbl.MaxVisibleGraphemes = -1
+	end)
+end)
+
+Remotes.Event("DialogueClose").OnClientEvent:Connect(function()
+	box.Visible = false; awaiting = false; typingId += 1
+end)
+
+local NUM_KEYS = { [Enum.KeyCode.One] = 1, [Enum.KeyCode.Two] = 2, [Enum.KeyCode.Three] = 3, [Enum.KeyCode.Four] = 4 }
+UserInputService.InputBegan:Connect(function(input, processed)
+	if processed or not box.Visible then return end
+	-- ASSUMPTION: 1-4 might be technique hotkeys in CombatController. While dialogue is open they pick choices;
+	-- CombatController will still receive them too unless it checks PlayerGui.DialogueUI.Frame.Visible.
+	local n = NUM_KEYS[input.KeyCode]
+	if n then
+		if textLbl.MaxVisibleGraphemes ~= -1 then typingId += 1; textLbl.MaxVisibleGraphemes = -1 return end -- first press skips typing
+		choose(n)
+	end
+end)
