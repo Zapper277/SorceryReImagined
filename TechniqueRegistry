@@ -1,0 +1,269 @@
+--!nonstrict
+--[[
+	TechniqueRegistry  (ServerScriptService/Services/TechniqueRegistry)
+	HEXBOUND - the server validates and runs techniques.
+
+	Flow for TechniqueRequest(slot, aimDirection):
+	  1. Validate argument types, rate limit, alive.
+	  2. Find the technique id from the player's loadout slot (the client never sends ids).
+	  3. Check the cooldown and HexService:CanSpend.
+	  4. CombatService:RunAction(...)  (fails unless Idle: no casting out of stun, block or M1s)
+	  5. Spend Hex and start the cooldown. The cost is committed at cast start; if you're
+	     interrupted during startup, the cast is lost and nothing is refunded (stated design choice).
+	  6. At active frames, run the kind handler (Melee / Projectile / Dash / Burst).
+
+	Public API:
+		TechniqueRegistry:SetLoadout(player, { id, id, ... })    -- ProgressionService / Lineages
+		TechniqueRegistry:GetLoadout(player)
+		TechniqueRegistry:Cast(model, techniqueId, aimDir?)        -- NPC curses / scripted casts
+		TechniqueRegistry:RegisterKind(kind, handler)              -- add new technique kinds
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local Shared = ReplicatedStorage:WaitForChild("Shared")
+local TechniqueData = require(Shared:WaitForChild("TechniqueData"))
+local CombatService = require(ServerScriptService.Services.CombatService)
+local HexService = require(ServerScriptService.Services.HexService)
+
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+local function getRemote(name)
+	local r = Remotes:FindFirstChild(name)
+	if not r then
+		r = Instance.new("RemoteEvent")
+		r.Name = name
+		r.Parent = Remotes
+	end
+	return r
+end
+local TechniqueRequest = getRemote("TechniqueRequest")   -- C->S (slot, aimDir)
+local TechniqueFeedback = getRemote("TechniqueFeedback") -- S->C owner: ("Cooldown", id, seconds) / ("Loadout", ids) / ("Denied", reason)
+local CombatFX = getRemote("CombatFX")                   -- S->all: ("Technique", caster, id, extra)
+
+local F = function(frames) return frames / 60 end
+local now = os.clock
+
+local MIN_REQUEST_INTERVAL = 0.1
+local MAX_AIM_ANGLE = math.rad(75) -- aim may differ from facing by at most this angle
+
+local TechniqueRegistry = {}
+
+local loadouts = {}      -- [Player] = { id, ... }
+local cooldowns = {}     -- [Model] = { [id] = readyAt }
+local lastRequest = {}   -- [Player] = time
+local kindHandlers = {}
+
+----------------------------------------------------------------------
+-- Helpers
+----------------------------------------------------------------------
+local function flat(v: Vector3)
+	local f = Vector3.new(v.X, 0, v.Z)
+	return f.Magnitude > 1e-3 and f.Unit or nil
+end
+
+local function isFiniteVector(v)
+	return typeof(v) == "Vector3" and v.X == v.X and v.Y == v.Y and v.Z == v.Z
+		and math.abs(v.X) < 1e6 and math.abs(v.Y) < 1e6 and math.abs(v.Z) < 1e6
+end
+
+-- Clamp the client's aim to a cone around the caster's facing. If the aim is invalid, use the facing.
+local function resolveAim(root: BasePart, aim): Vector3
+	local look = root.CFrame.LookVector
+	if not isFiniteVector(aim) or aim.Magnitude < 1e-3 then return look end
+	aim = aim.Unit
+	local fLook, fAim = flat(look), flat(aim)
+	if not fLook or not fAim then return look end
+	if math.acos(math.clamp(fLook:Dot(fAim), -1, 1)) > MAX_AIM_ANGLE then return look end
+	-- Allow a little vertical aim, capped at about 30°
+	local y = math.clamp(aim.Y, -0.5, 0.5)
+	return (fAim * math.sqrt(1 - y * y) + Vector3.new(0, y, 0)).Unit
+end
+
+local function feedback(model, ...)
+	local isPlayer, player = CombatService:IsPlayerEntity(model)
+	if isPlayer then TechniqueFeedback:FireClient(player, ...) end
+end
+
+----------------------------------------------------------------------
+-- Kind handlers: handler(caster, def, aimDir, isValid)
+----------------------------------------------------------------------
+kindHandlers.Melee = function(caster, def, _, isValid)
+	-- Check the box every frame during the active window; each target is hit once
+	local hitSet = {}
+	local endsAt = now() + F(def.active)
+	while now() < endsAt and isValid() do
+		for target in pairs(CombatService:QueryBox(caster, def.hitbox.size, def.hitbox.offset)) do
+			if not hitSet[target] then
+				hitSet[target] = true
+				CombatService:ApplyHit(caster, target, def.hit)
+				if not isValid() then return end -- parried
+			end
+		end
+		RunService.Heartbeat:Wait()
+	end
+end
+
+kindHandlers.Burst = kindHandlers.Melee -- offset 0 puts the box on the caster; knockback.outward does the rest
+
+kindHandlers.Projectile = function(caster, def, aimDir, _)
+	-- Once fired, the projectile flies even if the caster is hit afterwards
+	local root = CombatService:GetRoot(caster)
+	if not root then return end
+	local cfg = def.projectile
+	local origin = root.Position + aimDir * 2.5
+	local pos, traveled = origin, 0
+
+	CombatFX:FireAllClients("Technique", caster, def.id, { origin = origin, direction = aimDir, speed = cfg.speed, range = cfg.range })
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { caster }
+
+	while traveled < cfg.range do
+		local dt = RunService.Heartbeat:Wait()
+		local step = math.min(cfg.speed * dt, cfg.range - traveled)
+		local result = workspace:Spherecast(pos, cfg.radius, aimDir * step, params)
+		if result then
+			local model = result.Instance:FindFirstAncestorOfClass("Model")
+			if model and model:FindFirstChildOfClass("Humanoid") then
+				CombatService:ApplyHit(caster, model, def.hit)
+			end
+			CombatFX:FireAllClients("TechniqueImpact", caster, def.id, { position = result.Position })
+			return
+		end
+		pos += aimDir * step
+		traveled += step
+	end
+end
+
+kindHandlers.Dash = function(caster, def, aimDir, isValid)
+	local dir = flat(aimDir) or Vector3.zAxis
+	CombatService:ApplyVelocity(caster, dir * def.dash.speed, def.dash.duration)
+	if def.hitbox and def.hit then
+		kindHandlers.Melee(caster, def, aimDir, isValid)
+	end
+end
+
+function TechniqueRegistry:RegisterKind(kind: string, handler)
+	kindHandlers[kind] = handler
+end
+
+----------------------------------------------------------------------
+-- Casting
+----------------------------------------------------------------------
+function TechniqueRegistry:Cast(caster: Model, id: string, aimDir: Vector3?)
+	local def = TechniqueData.Techniques[id]
+	if not def then return false, "UnknownTechnique" end
+	def.id = id
+	local handler = kindHandlers[def.kind]
+	if not handler then return false, "UnknownKind" end
+
+	local root = CombatService:GetRoot(caster)
+	if not root then return false, "NoEntity" end
+	if caster:GetAttribute("TechniqueLocked") then return false, "Burnout" end
+
+	cooldowns[caster] = cooldowns[caster] or {}
+	if now() < (cooldowns[caster][id] or 0) then return false, "Cooldown" end
+	if not HexService:CanSpend(caster, def.hexCost) then return false, "NoHex" end
+
+	local aim = resolveAim(root, aimDir)
+
+	local started = CombatService:RunAction(caster, {
+		startup = def.startup,
+		active = def.active,
+		recovery = def.recovery,
+		onActive = function(isValid)
+			if not isValid() then return end
+			handler(caster, def, aim, isValid)
+		end,
+	})
+	if not started then return false, "NotActionable" end
+
+	-- RunAction succeeded on this same frame, so the earlier CanSpend result still holds
+	HexService:TrySpend(caster, def.hexCost, "Technique:" .. id)
+	cooldowns[caster][id] = now() + def.cooldown
+	feedback(caster, "Cooldown", id, def.cooldown)
+	if def.kind ~= "Projectile" then
+		CombatFX:FireAllClients("Technique", caster, id, nil)
+	else
+		CombatFX:FireAllClients("TechniqueStartup", caster, id, nil)
+	end
+	return true
+end
+
+----------------------------------------------------------------------
+-- Loadouts
+----------------------------------------------------------------------
+function TechniqueRegistry:SetLoadout(player: Player, ids)
+	local clean = {}
+	for i = 1, math.min(#ids, TechniqueData.MaxSlots) do
+		if TechniqueData.Techniques[ids[i]] then table.insert(clean, ids[i]) end
+	end
+	loadouts[player] = clean
+	TechniqueFeedback:FireClient(player, "Loadout", clean)
+end
+
+function TechniqueRegistry:GetLoadout(player: Player)
+	return loadouts[player] or {}
+end
+
+----------------------------------------------------------------------
+-- Remote
+----------------------------------------------------------------------
+local function onRequest(player: Player, slot, aimDir)
+	if type(slot) ~= "number" or slot ~= slot or slot % 1 ~= 0 then return end
+	if slot < 1 or slot > TechniqueData.MaxSlots then return end
+
+	local t = now()
+	if t - (lastRequest[player] or 0) < MIN_REQUEST_INTERVAL then return end
+	lastRequest[player] = t
+
+	local char = player.Character
+	if not char then return end
+	local id = (loadouts[player] or {})[slot]
+	if not id then return end
+
+	local ok, reason = TechniqueRegistry:Cast(char, id, aimDir)
+	if not ok and (reason == "NoHex" or reason == "Cooldown") then
+		TechniqueFeedback:FireClient(player, "Denied", reason, id)
+	end
+end
+
+function TechniqueRegistry:Init()
+	TechniqueRequest.OnServerEvent:Connect(onRequest)
+
+	-- Placeholder: everyone gets the default loadout until ProgressionService assigns Lineage techniques
+	local function hook(player)
+		self:SetLoadout(player, TechniqueData.DefaultLoadout)
+		player.CharacterAdded:Connect(function()
+			-- A new character resets cooldowns, and the client is sent its loadout again
+			self:SetLoadout(player, loadouts[player] or TechniqueData.DefaultLoadout)
+		end)
+	end
+	Players.PlayerAdded:Connect(hook)
+	for _, p in ipairs(Players:GetPlayers()) do hook(p) end
+
+	Players.PlayerRemoving:Connect(function(p)
+		loadouts[p] = nil
+		lastRequest[p] = nil
+		if p.Character then cooldowns[p.Character] = nil end
+	end)
+	-- Cooldowns are keyed by model; clear them when a character goes away
+	-- (NPC entries clear the same way, through AncestryChanged)
+	local function clearOnRemove(model)
+		model.AncestryChanged:Connect(function(_, parent)
+			if not parent then cooldowns[model] = nil end
+		end)
+	end
+	local origCast = self.Cast
+	local tracked = setmetatable({}, { __mode = "k" })
+	self.Cast = function(selfRef, caster, ...)
+		if caster and not tracked[caster] then tracked[caster] = true; clearOnRemove(caster) end
+		return origCast(selfRef, caster, ...)
+	end
+end
+
+return TechniqueRegistry
