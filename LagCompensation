@@ -1,0 +1,134 @@
+-- LagCompensation (ModuleScript, ServerScriptService)
+-- Fills the "no lag compensation" gap. Records a short position history for every
+-- character (players + curses) and lets CombatService test hitboxes against where
+-- targets WERE on the attacker's screen, without physically moving anything.
+--
+-- HOW TO USE IN CombatService (one-line swap where you currently do hitbox detection):
+--   local LagCompensation = require(script.Parent.LagCompensation)
+--   local hits = LagCompensation.QueryBox(attackerPlayer, hitboxCFrame, hitboxSize, { IgnoreModels = {attackerChar} })
+--   for _, model in hits do ... end
+--
+-- ASSUMPTIONS:
+--   * Curses (CurseAI) are Models with a Humanoid + HumanoidRootPart parented anywhere in workspace.
+--   * Curses don't need rewinding (server-owned), but they're tracked so one query covers everything.
+-- NEEDS PLAYTESTING: MAX_REWIND and TARGET_RADIUS tuning with real latency (use Studio's
+-- network simulation: File > Studio Settings > Network > Incoming Replication Lag).
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local CollectionService = game:GetService("CollectionService")
+
+local HISTORY_SECONDS = 1.0
+local MAX_REWIND = 0.25       -- never rewind more than this (anti-abuse for very high ping)
+local TARGET_RADIUS = 2.0     -- approximate torso half-width added to box tests
+local INTERP_BUFFER = 0.048   -- Roblox client interpolation delay (~3 frames)
+
+local LagCompensation = {}
+
+type Sample = { t: number, cf: CFrame }
+local history: { [Model]: { Sample } } = {}
+
+local function track(model: Model)
+	if history[model] then return end
+	history[model] = {}
+	model.AncestryChanged:Connect(function(_, parent)
+		if not parent then history[model] = nil end
+	end)
+end
+
+local function onCharacter(char: Model) track(char) end
+
+-- Rewind time for a player: half RTT + client interpolation delay, clamped.
+function LagCompensation.GetRewind(player: Player?): number
+	if not player then return 0 end
+	local ok, ping = pcall(function() return player:GetNetworkPing() end) -- seconds, one-way-ish
+	ping = ok and ping or 0
+	return math.clamp(ping + INTERP_BUFFER, 0, MAX_REWIND)
+end
+
+-- Interpolated CFrame of a tracked model at server time t.
+function LagCompensation.GetCFrameAt(model: Model, t: number): CFrame?
+	local h = history[model]
+	if not h or #h == 0 then
+		local root = model:FindFirstChild("HumanoidRootPart") :: BasePart?
+		return root and root.CFrame
+	end
+	if t >= h[#h].t then return h[#h].cf end
+	if t <= h[1].t then return h[1].cf end
+	for i = #h, 2, -1 do
+		local a, b = h[i - 1], h[i]
+		if a.t <= t and t <= b.t then
+			local alpha = (t - a.t) / math.max(b.t - a.t, 1e-4)
+			return a.cf:Lerp(b.cf, alpha)
+		end
+	end
+	return h[#h].cf
+end
+
+-- Point vs oriented box with padding.
+local function inBox(boxCF: CFrame, half: Vector3, point: Vector3, pad: number): boolean
+	local lp = boxCF:PointToObjectSpace(point)
+	return math.abs(lp.X) <= half.X + pad and math.abs(lp.Y) <= half.Y + pad and math.abs(lp.Z) <= half.Z + pad
+end
+
+export type QueryOpts = { IgnoreModels: { Model }?, Radius: number?, IncludeDead: boolean? }
+
+-- Returns list of Models (with Humanoids) whose rewound root position overlaps the box.
+function LagCompensation.QueryBox(attacker: Player?, boxCF: CFrame, size: Vector3, opts: QueryOpts?): { Model }
+	opts = opts or {}
+	local ignore = {}
+	for _, m in (opts :: QueryOpts).IgnoreModels or {} do ignore[m] = true end
+	if attacker and attacker.Character then ignore[attacker.Character] = true end
+	local t = os.clock() - LagCompensation.GetRewind(attacker)
+	local half = size / 2
+	local pad = (opts :: QueryOpts).Radius or TARGET_RADIUS
+	local hits = {}
+	for model in history do
+		if not ignore[model] and model.Parent then
+			local hum = model:FindFirstChildOfClass("Humanoid")
+			if hum and ((opts :: QueryOpts).IncludeDead or hum.Health > 0) then
+				-- Only rewind other PLAYERS; server-owned NPCs are already where the client sees them (approximately)
+				local isPlayer = Players:GetPlayerFromCharacter(model) ~= nil
+				local cf = isPlayer and LagCompensation.GetCFrameAt(model, t) or (model:FindFirstChild("HumanoidRootPart") and model.HumanoidRootPart.CFrame)
+				if cf and inBox(boxCF, half, cf.Position, pad) then table.insert(hits, model) end
+			end
+		end
+	end
+	return hits
+end
+
+-- Sphere variant (for AoE techniques)
+function LagCompensation.QuerySphere(attacker: Player?, center: Vector3, radius: number, opts: QueryOpts?): { Model }
+	return LagCompensation.QueryBox(attacker, CFrame.new(center), Vector3.one * radius * 2, opts)
+end
+
+-- Manually register NPC models if they don't use CollectionService tag "Curse"
+function LagCompensation.Track(model: Model) track(model) end
+
+function LagCompensation.Init() end
+
+function LagCompensation.Start()
+	for _, p in Players:GetPlayers() do
+		if p.Character then onCharacter(p.Character) end
+		p.CharacterAdded:Connect(onCharacter)
+	end
+	Players.PlayerAdded:Connect(function(p) p.CharacterAdded:Connect(onCharacter) end)
+
+	-- ASSUMPTION: CurseAI tags curse models with "Curse". If not, call LagCompensation.Track(model) from CurseAI.
+	for _, m in CollectionService:GetTagged("Curse") do if m:IsA("Model") then track(m) end end
+	CollectionService:GetInstanceAddedSignal("Curse"):Connect(function(m) if m:IsA("Model") then track(m) end end)
+
+	RunService.Heartbeat:Connect(function()
+		local now = os.clock()
+		local cutoff = now - HISTORY_SECONDS
+		for model, h in history do
+			local root = model:FindFirstChild("HumanoidRootPart") :: BasePart?
+			if root then
+				table.insert(h, { t = now, cf = root.CFrame })
+				while #h > 2 and h[1].t < cutoff do table.remove(h, 1) end
+			end
+		end
+	end)
+end
+
+return LagCompensation
