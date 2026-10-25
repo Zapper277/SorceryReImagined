@@ -1,0 +1,207 @@
+--!nonstrict
+--[[
+	ProgressionService  (ServerScriptService/Services/ProgressionService)
+	HEXBOUND - XP, levels, sorcerer Grade, stat allocation, and applying the
+	Lineage, stats and equipment to the character on every spawn.
+
+	Stats (each point):
+	  Vitality   +4 max health
+	  Strength   +1% damage dealt (sets the "DamageMult" attribute read by CombatService)
+	  HexControl +2 max Hex
+
+	Remote ProgressionRequest:
+	  ("AllocateStat", statName: string, amount: number)
+	Replicated to the client: Level, XP, XPToNext, Grade, StatPoints, Lineage attributes on the Player.
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local Shared = ReplicatedStorage:WaitForChild("Shared")
+local LineageData = require(Shared:WaitForChild("LineageData"))
+local ItemData = require(Shared:WaitForChild("ItemData"))
+
+local Services = ServerScriptService.Services
+local PlayerDataService = require(Services.PlayerDataService)
+local HexService = require(Services.HexService)
+local TechniqueRegistry = require(Services.TechniqueRegistry)
+
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+local ProgressionRequest = Remotes:FindFirstChild("ProgressionRequest") or Instance.new("RemoteEvent")
+ProgressionRequest.Name = "ProgressionRequest"
+ProgressionRequest.Parent = Remotes
+
+local CONFIG = {
+	maxLevel = 100,
+	statPointsPerLevel = 3,
+	baseHealth = 100,
+	baseHex = 100,
+	perPoint = { Vitality = 4, Strength = 0.01, HexControl = 2 },
+	statCap = 100, -- max points in a single stat (allocated, not counting gear)
+	grades = { -- by level, lowest first
+		{ id = "Grade4", level = 1 },
+		{ id = "Grade3", level = 15 },
+		{ id = "Grade2", level = 30 },
+		{ id = "Grade1", level = 50 },
+		{ id = "Special", level = 75 },
+	},
+}
+
+local ProgressionService = {}
+
+function ProgressionService.xpToNext(level: number): number
+	return math.floor(100 * level ^ 1.5)
+end
+
+function ProgressionService.gradeFor(level: number): string
+	local g = CONFIG.grades[1].id
+	for _, entry in ipairs(CONFIG.grades) do
+		if level >= entry.level then g = entry.id end
+	end
+	return g
+end
+
+----------------------------------------------------------------------
+-- Derived stats
+----------------------------------------------------------------------
+local function totalStats(data)
+	local total = { Vitality = 0, Strength = 0, HexControl = 0 }
+	for k, v in pairs(data.stats) do total[k] = (total[k] or 0) + v end
+	-- Add gear: equipped holds slot -> uid
+	for _, uid in pairs(data.equipped) do
+		for _, entry in ipairs(data.inventory) do
+			if entry.uid == uid then
+				local def = ItemData.Items[entry.id]
+				if def and def.stats then
+					for k, v in pairs(def.stats) do total[k] = (total[k] or 0) + v end
+				end
+			end
+		end
+	end
+	return total
+end
+
+local function replicate(player, data)
+	player:SetAttribute("Level", data.level)
+	player:SetAttribute("XP", data.xp)
+	player:SetAttribute("XPToNext", ProgressionService.xpToNext(data.level))
+	player:SetAttribute("Grade", ProgressionService.gradeFor(data.level))
+	player:SetAttribute("StatPoints", data.statPoints)
+	player:SetAttribute("Lineage", data.lineage)
+	player:SetAttribute("Spins", data.spins)
+	player:SetAttribute("Marks", data.currency.Marks)
+	for k, v in pairs(data.stats) do player:SetAttribute("Stat_" .. k, v) end
+end
+
+-- Applies everything to the current character. Safe to call any time (after a level up, roll, or equip change)
+function ProgressionService:Apply(player)
+	local data = PlayerDataService:GetProfile(player)
+	local char = player.Character
+	if not data or not char then return end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if not hum then return end
+
+	local lineage = LineageData.Lineages[data.lineage] or LineageData.Lineages.AshenScript
+	local s = totalStats(data)
+
+	local maxHealth = CONFIG.baseHealth + s.Vitality * CONFIG.perPoint.Vitality + (lineage.bonuses.maxHealth or 0)
+	local frac = hum.MaxHealth > 0 and hum.Health / hum.MaxHealth or 1
+	hum.MaxHealth = maxHealth
+	hum.Health = math.max(1, maxHealth * frac)
+
+	char:SetAttribute("DamageMult", 1 + s.Strength * CONFIG.perPoint.Strength)
+	HexService:SetMax(char, CONFIG.baseHex + s.HexControl * CONFIG.perPoint.HexControl + (lineage.bonuses.maxHex or 0))
+	TechniqueRegistry:SetLoadout(player, lineage.techniques)
+	replicate(player, data)
+end
+
+----------------------------------------------------------------------
+-- XP / levels
+----------------------------------------------------------------------
+function ProgressionService:AddXP(player, amount: number)
+	local data = PlayerDataService:GetProfile(player)
+	if not data or type(amount) ~= "number" or amount <= 0 then return end
+	data.xp += math.floor(amount)
+	local leveled = false
+	while data.level < CONFIG.maxLevel and data.xp >= self.xpToNext(data.level) do
+		data.xp -= self.xpToNext(data.level)
+		data.level += 1
+		data.statPoints += CONFIG.statPointsPerLevel
+		leveled = true
+	end
+	if data.level >= CONFIG.maxLevel then data.xp = 0 end
+	PlayerDataService:MarkDirty(player)
+	if leveled then self:Apply(player) else replicate(player, data) end
+end
+
+function ProgressionService:AddMarks(player, amount: number)
+	local data = PlayerDataService:GetProfile(player)
+	if not data or type(amount) ~= "number" then return false end
+	if data.currency.Marks + amount < 0 then return false end
+	data.currency.Marks += math.floor(amount)
+	PlayerDataService:MarkDirty(player)
+	player:SetAttribute("Marks", data.currency.Marks)
+	return true
+end
+
+function ProgressionService:SetLineage(player, lineageId: string)
+	local data = PlayerDataService:GetProfile(player)
+	if not data or not LineageData.Lineages[lineageId] then return end
+	data.lineage = lineageId
+	PlayerDataService:MarkDirty(player)
+	self:Apply(player)
+end
+
+function ProgressionService:ResetStats(player)
+	local data = PlayerDataService:GetProfile(player)
+	if not data then return end
+	local refund = 0
+	for k, v in pairs(data.stats) do refund += v; data.stats[k] = 0 end
+	data.statPoints += refund
+	PlayerDataService:MarkDirty(player)
+	self:Apply(player)
+end
+
+function ProgressionService:Refresh(player)
+	local data = PlayerDataService:GetProfile(player)
+	if data then replicate(player, data) end
+end
+
+----------------------------------------------------------------------
+-- Remote
+----------------------------------------------------------------------
+local function onRequest(player, action, a, b)
+	local data = PlayerDataService:GetProfile(player)
+	if not data then return end
+	if action == "AllocateStat" then
+		if type(a) ~= "string" or data.stats[a] == nil then return end
+		if type(b) ~= "number" or b ~= b or b % 1 ~= 0 or b < 1 then return end
+		local amount = math.min(b, data.statPoints, CONFIG.statCap - data.stats[a])
+		if amount <= 0 then return end
+		data.stats[a] += amount
+		data.statPoints -= amount
+		PlayerDataService:MarkDirty(player)
+		ProgressionService:Apply(player)
+	end
+end
+
+function ProgressionService:Init()
+	ProgressionRequest.OnServerEvent:Connect(onRequest)
+
+	local function hook(player)
+		player.CharacterAdded:Connect(function(char)
+			char:WaitForChild("Humanoid")
+			PlayerDataService:WaitForProfile(player)
+			task.defer(function() self:Apply(player) end) -- after Combat and Hex have registered the character
+		end)
+	end
+	PlayerDataService.ProfileLoaded:Connect(function(player, data)
+		replicate(player, data)
+		if player.Character then self:Apply(player) end
+	end)
+	Players.PlayerAdded:Connect(hook)
+	for _, p in ipairs(Players:GetPlayers()) do hook(p) end
+end
+
+return ProgressionService
