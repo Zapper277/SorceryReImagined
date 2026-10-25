@@ -1,0 +1,203 @@
+-- AdminCommands (ModuleScript, ServerScriptService)
+-- Chat + remote debug commands for testing in Studio (nothing has been tested in Studio yet, so you'll want these).
+-- In Studio, EVERYONE is admin automatically. In live servers only ADMIN_IDS are.
+--
+-- Type in chat:  /help
+--
+-- ASSUMPTIONS: calls into your services go through `call()` with fallback names - same idea as
+-- ClientBridgeService. If a command prints "not wired", fix the service/method name in that command.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+local Remotes = require(ReplicatedStorage:WaitForChild("Remotes"))
+
+local ADMIN_IDS = {
+	-- [12345678] = true,  -- <-- put your Roblox UserId here
+}
+
+local PREFIX = "/"
+
+local AdminCommands = {}
+local godMode: { [Player]: RBXScriptConnection } = {}
+
+local function isAdmin(p: Player) return RunService:IsStudio() or ADMIN_IDS[p.UserId] == true or game.CreatorId == p.UserId end
+local function reply(p, text, kind) Remotes.Event("Notify"):FireClient(p, text, kind) end
+
+local function svc(name)
+	local m = ServerScriptService:FindFirstChild(name, true)
+	if m and m:IsA("ModuleScript") then local ok, r = pcall(require, m); if ok then return r end end
+	return nil
+end
+
+-- call({"Service.Method", ...}, args...) -> ok, result
+local function call(candidates, ...)
+	for _, path in candidates do
+		local s, m = string.match(path, "^(%w+)%.(%w+)$")
+		local mod = s and svc(s)
+		if mod and type(mod[m]) == "function" then
+			local ok, r = pcall(mod[m], mod, ...)
+			return ok, r
+		end
+	end
+	return false, "not wired: " .. table.concat(candidates, " / ")
+end
+
+local function findPlayer(caller, name)
+	if not name or name == "me" then return caller end
+	name = name:lower()
+	for _, p in Players:GetPlayers() do
+		if p.Name:lower():sub(1, #name) == name or p.DisplayName:lower():sub(1, #name) == name then return p end
+	end
+	return nil
+end
+
+local function bridge() return svc("ClientBridgeService") end
+
+local COMMANDS = {}
+
+COMMANDS.help = { "List commands", function(p)
+	local names = {}
+	for n, c in COMMANDS do table.insert(names, PREFIX .. n .. " - " .. c[1]) end
+	table.sort(names)
+	for _, l in names do reply(p, l) end
+	print("[Admin] " .. table.concat(names, "\n"))
+end }
+
+COMMANDS.heal = { "heal [player]", function(p, args)
+	local t = findPlayer(p, args[1]); local h = t and t.Character and t.Character:FindFirstChildOfClass("Humanoid")
+	if h then h.Health = h.MaxHealth; reply(p, "Healed " .. t.Name, "Good") end
+end }
+
+COMMANDS.god = { "toggle god mode [player]", function(p, args)
+	local t = findPlayer(p, args[1]); if not t then return end
+	if godMode[t] then godMode[t]:Disconnect(); godMode[t] = nil; reply(p, "God OFF for " .. t.Name) return end
+	local h = t.Character and t.Character:FindFirstChildOfClass("Humanoid"); if not h then return end
+	godMode[t] = h.HealthChanged:Connect(function() if h.Health < h.MaxHealth then h.Health = h.MaxHealth end end)
+	reply(p, "God ON for " .. t.Name, "Good")
+end }
+
+COMMANDS.kill = { "kill [player]", function(p, args)
+	local t = findPlayer(p, args[1]); local h = t and t.Character and t.Character:FindFirstChildOfClass("Humanoid")
+	if h then h.Health = 0 end
+end }
+
+COMMANDS.tp = { "tp <player>  (teleport to them)", function(p, args)
+	local t = findPlayer(p, args[1])
+	local a = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+	local b = t and t.Character and t.Character:FindFirstChild("HumanoidRootPart")
+	if a and b then a.CFrame = b.CFrame * CFrame.new(0, 0, 4) end
+end }
+
+COMMANDS.speed = { "speed <n> [player]", function(p, args)
+	local t = findPlayer(p, args[2]); local h = t and t.Character and t.Character:FindFirstChildOfClass("Humanoid")
+	-- NOTE: MovementGuard may flag this as speed hacking. Whitelist admins there or expect a rubber-band.
+	if h then h.WalkSpeed = tonumber(args[1]) or 16 end
+end }
+
+COMMANDS.hex = { "hex <amount> [player]  (fill/set Hex)", function(p, args)
+	local t = findPlayer(p, args[2]); if not t then return end
+	local ok, r = call({ "HexService.SetHex", "HexService.AddHex", "HexService.Restore" }, t, tonumber(args[1]) or 9999)
+	reply(p, ok and "Hex set" or tostring(r), ok and "Good" or "Bad")
+end }
+
+COMMANDS.xp = { "xp <amount> [player]", function(p, args)
+	local t = findPlayer(p, args[2]); if not t then return end
+	local ok, r = call({ "ProgressionService.AddXP", "ProgressionService.GiveXP", "ProgressionService.AddExperience" }, t, tonumber(args[1]) or 100)
+	reply(p, ok and "XP given" or tostring(r), ok and "Good" or "Bad")
+end }
+
+COMMANDS.level = { "level <n> [player]", function(p, args)
+	local t = findPlayer(p, args[2]); if not t then return end
+	local ok, r = call({ "ProgressionService.SetLevel" }, t, tonumber(args[1]) or 1)
+	reply(p, ok and "Level set" or tostring(r), ok and "Good" or "Bad")
+end }
+
+COMMANDS.give = { "give <itemId> [qty] [player]", function(p, args)
+	local t = findPlayer(p, args[3]); if not t or not args[1] then return end
+	local ok, r = call({ "InventoryService.AddItem", "InventoryService.GiveItem" }, t, args[1], tonumber(args[2]) or 1)
+	reply(p, ok and ("Gave " .. args[1]) or tostring(r), ok and "Good" or "Bad")
+	local b = bridge(); if b then b.PushInventory(t) end
+end }
+
+COMMANDS.spins = { "spins <n> [player]  (give lineage rolls)", function(p, args)
+	local t = findPlayer(p, args[2]); if not t then return end
+	local ok, r = call({ "RollService.AddSpins", "RollService.GiveSpins", "RollService.AddRolls" }, t, tonumber(args[1]) or 10)
+	reply(p, ok and "Spins given" or tostring(r), ok and "Good" or "Bad")
+	local b = bridge(); if b then b.PushLineage(t) end
+end }
+
+COMMANDS.lineage = { "lineage <lineageId> [player]  (force set)", function(p, args)
+	local t = findPlayer(p, args[2]); if not t or not args[1] then return end
+	local ok, r = call({ "RollService.SetLineage", "PlayerDataService.SetLineage" }, t, args[1])
+	reply(p, ok and ("Lineage -> " .. args[1]) or tostring(r), ok and "Good" or "Bad")
+	local b = bridge(); if b then b.PushLineage(t) end
+end }
+
+COMMANDS.domain = { "domain [player]  (force-open their Domain)", function(p, args)
+	local t = findPlayer(p, args[1]); if not t then return end
+	local ok, r = call({ "DomainService.ActivateDomain", "DomainService.OpenDomain", "DomainService.Cast" }, t)
+	reply(p, ok and "Domain opened" or tostring(r), ok and "Good" or "Bad")
+end }
+
+COMMANDS.curse = { "curse [curseType] [count]  (spawn in front of you)", function(p, args)
+	local root = p.Character and p.Character:FindFirstChild("HumanoidRootPart"); if not root then return end
+	local n = math.clamp(tonumber(args[2]) or 1, 1, 20)
+	for i = 1, n do
+		local pos = (root.CFrame * CFrame.new((i - 1) * 4 - (n - 1) * 2, 0, -12)).Position
+		local ok, r = call({ "CurseAI.SpawnCurse", "CurseAI.Spawn" }, args[1] or "Default", pos)
+		if not ok then reply(p, tostring(r), "Bad") return end
+	end
+	reply(p, "Spawned " .. n, "Good")
+end }
+
+COMMANDS.mission = { "mission <id> [player]  (force accept)", function(p, args)
+	local t = findPlayer(p, args[2]); if not t or not args[1] then return end
+	local ok, r = call({ "MissionService.AcceptMission", "MissionService.StartMission" }, t, args[1])
+	reply(p, ok and "Mission started" or tostring(r), ok and "Good" or "Bad")
+	local b = bridge(); if b then b.PushMissions(t) end
+end }
+
+COMMANDS.rebuild = { "rebuild  (re-run MapBuilder)", function(p)
+	local ok, r = call({ "MapBuilder.Build", "MapBuilder.BuildMap", "MapBuilder.Generate" })
+	reply(p, ok and "Map rebuilt" or tostring(r), ok and "Good" or "Bad")
+end }
+
+COMMANDS.wipe = { "wipe [player]  (STUDIO ONLY - reset save data)", function(p, args)
+	if not RunService:IsStudio() then reply(p, "Studio only.", "Bad") return end
+	local t = findPlayer(p, args[1]); if not t then return end
+	local ok, r = call({ "PlayerDataService.ResetData", "PlayerDataService.Wipe" }, t)
+	reply(p, ok and "Data wiped - rejoin" or tostring(r), ok and "Good" or "Bad")
+end }
+
+COMMANDS.ping = { "show your rewind/ping", function(p)
+	local lc = svc("LagCompensation")
+	reply(p, ("Ping %.0f ms | rewind %.0f ms"):format(p:GetNetworkPing() * 1000, lc and lc.GetRewind(p) * 1000 or 0))
+end }
+
+local function run(p: Player, msg: string)
+	if type(msg) ~= "string" or msg:sub(1, #PREFIX) ~= PREFIX then return end
+	if not isAdmin(p) then return end
+	local parts = string.split(msg:sub(#PREFIX + 1), " ")
+	local name = table.remove(parts, 1)
+	local cmd = name and COMMANDS[name:lower()]
+	if not cmd then return end
+	local ok, err = pcall(cmd[2], p, parts)
+	if not ok then reply(p, "Command error: " .. tostring(err), "Bad") end
+end
+
+function AdminCommands.Run(p, msg) run(p, msg) end
+function AdminCommands.Init() end
+
+function AdminCommands.Start()
+	local function hook(p) p.Chatted:Connect(function(m) run(p, m) end) end
+	Players.PlayerAdded:Connect(hook)
+	for _, p in Players:GetPlayers() do hook(p) end
+	Remotes.Event("AdminCommand").OnServerEvent:Connect(function(p, msg)
+		if Remotes.RateLimit(p, "admin", 4, 6) then run(p, msg) end
+	end)
+	Players.PlayerRemoving:Connect(function(p) if godMode[p] then godMode[p]:Disconnect(); godMode[p] = nil end end)
+end
+
+return AdminCommands
