@@ -1,0 +1,73 @@
+-- TutorialService (ModuleScript, ServerScriptService)
+-- Tracks first-time-player tutorial progress in the save (data.Tutorial = { Step, Done }) and hands out
+-- the completion reward exactly ONCE (server checks the Done flag, so replaying the remote does nothing).
+--
+-- Steps are client-detected (UI/movement steps can't be meaningfully server-verified), EXCEPT the reward,
+-- which is server-only. Steps must arrive in order; skipping ahead is rejected.
+-- ASSUMPTIONS: reward uses the same currency/XP adapters as ShopService/AdminCommands. Fix names if Output warns.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Remotes = require(ReplicatedStorage:WaitForChild("Remotes"))
+local Locator = require(script.Parent:WaitForChild("ServiceLocator"))
+
+local STEP_COUNT = 7 -- must match #STEPS in TutorialController
+local REWARD = { Currency = 500, XP = 100, Spins = 1 }
+
+local TutorialService = {}
+local session = {}
+
+local function state(player)
+	local d = Locator.GetData(player)
+	if d then
+		if type(d.Tutorial) ~= "table" then d.Tutorial = { Step = 0, Done = false } end
+		return d.Tutorial
+	end
+	session[player] = session[player] or { Step = 0, Done = false }
+	return session[player]
+end
+
+local function reward(player)
+	local shop = Locator.Service("ShopService")
+	if REWARD.Currency > 0 then
+		local found = Locator.Try("tutorialCurrency", { "ProgressionService.AddCurrency", "PlayerDataService.AddCurrency", "InventoryService.AddCurrency" }, player, REWARD.Currency)
+		if not found then
+			local d = Locator.GetData(player)
+			for _, f in { "Currency", "Yen", "Money", "Gold", "Cash" } do
+				if d and type(d[f]) == "number" then d[f] += REWARD.Currency break end
+			end
+		end
+	end
+	if REWARD.XP > 0 then Locator.Try("tutorialXP", { "ProgressionService.AddXP", "ProgressionService.GiveXP", "ProgressionService.AddExperience" }, player, REWARD.XP) end
+	if REWARD.Spins > 0 then Locator.Try("tutorialSpins", { "RollService.AddSpins", "RollService.GiveSpins", "RollService.AddRolls" }, player, REWARD.Spins) end
+	if shop then Remotes.Event("CurrencySync"):FireClient(player, shop.GetCurrency(player)) end
+	local bridge = Locator.Service("ClientBridgeService")
+	if bridge then bridge.PushLineage(player) end
+	Remotes.Event("Notify"):FireClient(player, ("Tutorial complete! +%d Yen, +%d XP, +%d Spin"):format(REWARD.Currency, REWARD.XP, REWARD.Spins), "Good")
+end
+
+function TutorialService.IsDone(player) return state(player).Done == true end
+function TutorialService.Init() end
+
+function TutorialService.Start()
+	Remotes.Function("GetTutorialState").OnServerInvoke = function(player)
+		local s = state(player)
+		return { Done = s.Done, Step = s.Step }
+	end
+
+	Remotes.Event("TutorialStep").OnServerEvent:Connect(function(player, step, skip)
+		if not Remotes.RateLimit(player, "tutorial", 2, 4) then return end
+		local s = state(player)
+		if s.Done then return end
+		if skip == true then s.Done = true; s.Step = STEP_COUNT return end -- skipping = no reward
+		if type(step) ~= "number" or step ~= s.Step + 1 then return end
+		s.Step = step
+		if step >= STEP_COUNT then
+			s.Done = true
+			reward(player)
+		end
+	end)
+
+	game:GetService("Players").PlayerRemoving:Connect(function(p) session[p] = nil end)
+end
+
+return TutorialService
