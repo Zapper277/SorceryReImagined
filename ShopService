@@ -1,0 +1,177 @@
+-- ShopService (ModuleScript, ServerScriptService)
+-- Server-authoritative vendor buy/sell. Prices come ONLY from ShopData on the server; the client
+-- sends (shopId, index, qty) and never a price.
+--
+-- CURRENCY ADAPTERS (ASSUMPTIONS - fix names here if Output warns):
+--   getCurrency(player) -> number
+--   spendCurrency(player, amount) -> boolean   (must fail if not enough)
+--   addCurrency(player, amount)
+-- Fallback: reads/writes data.Currency / data.Yen / data.Money directly on the PlayerDataService table.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Remotes = require(ReplicatedStorage:WaitForChild("Remotes"))
+local ShopData = require(ReplicatedStorage:WaitForChild("ShopData"))
+local Locator = require(script.Parent:WaitForChild("ServiceLocator"))
+
+local SHOP_RANGE = 20
+
+local ShopService = {}
+local openShop: { [Player]: string } = {}
+
+---------------------------------------------------------------- currency adapters
+local CURRENCY_FIELDS = { "Currency", "Yen", "Money", "Gold", "Cash" }
+
+local function fieldOf(data)
+	for _, f in CURRENCY_FIELDS do if type(data[f]) == "number" then return f end end
+	return nil
+end
+
+local function getCurrency(player): number
+	local found, v = Locator.Try("getCurrency", { "ProgressionService.GetCurrency", "PlayerDataService.GetCurrency", "InventoryService.GetCurrency" }, player)
+	if found and type(v) == "number" then return v end
+	local d = Locator.GetData(player)
+	local f = d and fieldOf(d)
+	return f and d[f] or 0
+end
+
+local function spendCurrency(player, amount: number): boolean
+	local found, ok = Locator.Try("spendCurrency", { "ProgressionService.SpendCurrency", "PlayerDataService.SpendCurrency", "InventoryService.SpendCurrency" }, player, amount)
+	if found then return ok ~= false end
+	local d = Locator.GetData(player)
+	local f = d and fieldOf(d)
+	if not f or d[f] < amount then return false end
+	d[f] -= amount
+	return true
+end
+
+local function addCurrency(player, amount: number)
+	local found = Locator.Try("addCurrency", { "ProgressionService.AddCurrency", "PlayerDataService.AddCurrency", "InventoryService.AddCurrency" }, player, amount)
+	if found then return end
+	local d = Locator.GetData(player)
+	local f = d and fieldOf(d)
+	if f then d[f] += amount end
+end
+
+---------------------------------------------------------------- item helpers
+local function itemDef(itemId)
+	return Locator.Lookup(Locator.Shared("ItemData"), "Items", itemId)
+end
+
+local function itemValue(itemId): number
+	local d = itemDef(itemId)
+	return d and (d.SellPrice or d.Value or d.Price) or 10
+end
+
+local function countOf(player, itemId): (number, any)
+	-- returns quantity owned + a uid to remove with
+	local bridge = Locator.Service("ClientBridgeService")
+	local inv = bridge and bridge.Adapters.getInventory(player) or {}
+	local items = inv.Items or inv.Slots or inv
+	local total, uid = 0, nil
+	for k, v in items do
+		if type(v) == "table" and (v.ItemId or v.Id) == itemId and not v.Equipped then
+			total += v.Quantity or v.Amount or 1; uid = uid or v.Uid or v.Id or k
+		elseif type(v) == "number" and k == itemId then
+			total += v; uid = k
+		end
+	end
+	return total, uid
+end
+
+local function sync(player)
+	Remotes.Event("CurrencySync"):FireClient(player, getCurrency(player), ShopData.Currency)
+	local bridge = Locator.Service("ClientBridgeService")
+	if bridge then bridge.PushInventory(player) end
+end
+
+local function nearShop(player, shopId)
+	local npc = Locator.Service("NPCService")
+	if not npc then return true end
+	local npcId = npc.GetNPCForShop(shopId)
+	return npcId == nil or npc.IsNear(player, npcId, SHOP_RANGE)
+end
+
+---------------------------------------------------------------- public
+function ShopService.Open(player: Player, shopId: string)
+	local shop = ShopData.Shops[shopId]
+	if not shop then return end
+	openShop[player] = shopId
+	local stock = {}
+	for i, s in shop.Stock do
+		local d = itemDef(s.ItemId) or {}
+		stock[i] = { Index = i, ItemId = s.ItemId, Price = s.Price, Limit = s.Limit or 10,
+			Name = d.Name or d.DisplayName or s.ItemId, Rarity = d.Rarity or "Common", Description = d.Description or "" }
+	end
+	Remotes.Event("ShopOpen"):FireClient(player, {
+		ShopId = shopId, Name = shop.Name, Stock = stock, CanSell = shop.CanSell, SellRate = shop.SellRate,
+		Currency = getCurrency(player), CurrencyName = ShopData.Currency,
+	})
+end
+
+function ShopService.Buy(player, shopId, index, qty)
+	local shop = ShopData.Shops[shopId]
+	local entry = shop and shop.Stock[index]
+	if not entry then return { Ok = false, Reason = "Invalid item" } end
+	qty = math.clamp(math.floor(qty), 1, entry.Limit or 10)
+	local cost = entry.Price * qty
+	if getCurrency(player) < cost then return { Ok = false, Reason = "Not enough " .. ShopData.Currency } end
+	if not spendCurrency(player, cost) then return { Ok = false, Reason = "Not enough " .. ShopData.Currency } end
+	local found, res = Locator.Try("addItem", { "InventoryService.AddItem", "InventoryService.GiveItem" }, player, entry.ItemId, qty)
+	if not found or res == false then
+		addCurrency(player, cost) -- refund
+		return { Ok = false, Reason = "Inventory full or item invalid" }
+	end
+	return { Ok = true }
+end
+
+function ShopService.Sell(player, shopId, itemId, qty)
+	local shop = ShopData.Shops[shopId]
+	if not shop or not shop.CanSell or type(itemId) ~= "string" then return { Ok = false, Reason = "Can't sell here" } end
+	local have, uid = countOf(player, itemId)
+	qty = math.clamp(math.floor(qty), 1, 99)
+	if have < qty or uid == nil then return { Ok = false, Reason = "You don't have that many (equipped items can't be sold)" } end
+	local found, res = Locator.Try("removeItem", { "InventoryService.RemoveItem", "InventoryService.TakeItem" }, player, uid, qty)
+	if not found or res == false then return { Ok = false, Reason = "Couldn't remove item" } end
+	addCurrency(player, math.max(1, math.floor(itemValue(itemId) * (shop.SellRate or 0.3))) * qty)
+	return { Ok = true }
+end
+
+function ShopService.GetCurrency(player) return getCurrency(player) end
+
+function ShopService.Init() end
+
+function ShopService.Start()
+	-- Validate ShopData against ItemData once so bad ids show up immediately in Studio
+	task.defer(function()
+		local ItemData = Locator.Shared("ItemData")
+		if not ItemData then return end
+		for shopId, shop in ShopData.Shops do
+			for _, s in shop.Stock do
+				if not itemDef(s.ItemId) then warn(("[ShopService] ShopData.%s has unknown ItemId '%s' - fix ShopData"):format(shopId, s.ItemId)) end
+			end
+		end
+	end)
+
+	Remotes.Function("ShopTransaction").OnServerInvoke = function(player, kind, shopId, a, qty)
+		if not Remotes.RateLimit(player, "shop", 4, 6) then return { Ok = false, Reason = "Slow down" } end
+		if openShop[player] ~= shopId or not ShopData.Shops[shopId] then return { Ok = false, Reason = "Shop not open" } end
+		if not nearShop(player, shopId) then return { Ok = false, Reason = "Too far from the vendor" } end
+		if type(qty) ~= "number" or qty ~= qty then qty = 1 end -- NaN guard
+		local res
+		if kind == "Buy" and type(a) == "number" then res = ShopService.Buy(player, shopId, a, qty)
+		elseif kind == "Sell" then res = ShopService.Sell(player, shopId, a, qty)
+		else res = { Ok = false, Reason = "Bad request" } end
+		sync(player)
+		res.Currency = getCurrency(player)
+		return res
+	end
+
+	local function onJoin(p) task.delay(3, function() if p.Parent then sync(p) end end) end
+	Players.PlayerAdded:Connect(onJoin)
+	for _, p in Players:GetPlayers() do onJoin(p) end
+	Players.PlayerRemoving:Connect(function(p) openShop[p] = nil end)
+end
+
+return ShopService
