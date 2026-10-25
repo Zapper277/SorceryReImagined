@@ -1,0 +1,705 @@
+--!nonstrict
+--[[
+	CombatService  (ServerScriptService/Services/CombatService)
+	HEXBOUND - the server decides every combat outcome: the M1 chain, block/parry, hitstun and knockback.
+
+	Clients only send *intent* through ReplicatedStorage.Remotes.CombatRequest:
+		"M1"          -> attempt the next hit in the chain
+		"BlockStart"  -> raise guard (the first frames are the parry window)
+		"BlockEnd"    -> lower guard
+	The server checks state, timing, rate limits and hitboxes. Clients play animations
+	and VFX using the "CombatState" attribute and the CombatFX remote.
+
+	Other services (TechniqueRegistry, DomainService, AI) can call:
+		CombatService:RegisterEntity(model)                 -- NPC curses
+		CombatService:ApplyHit(attackerModel, targetModel, hitData)
+		CombatService:IsActionable(model)
+		CombatService.HitLanded / Blocked / Parried / GuardBroken  (signals)
+
+	State machine:
+		Idle -> M1Startup -> M1Active -> M1Recovery -> (chain | Idle)
+		Idle -> Blocking -> BlockRecovery -> Idle
+		any  -> Hitstun | Blockstun | ParryStunned | GuardBroken -> Idle
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Debris = game:GetService("Debris")
+
+local FrameData = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("CombatFrameData"))
+local F = FrameData.toSeconds
+
+----------------------------------------------------------------------
+-- Tiny signal
+----------------------------------------------------------------------
+local Signal = {}
+Signal.__index = Signal
+function Signal.new() return setmetatable({ _handlers = {} }, Signal) end
+function Signal:Connect(fn)
+	table.insert(self._handlers, fn)
+	return { Disconnect = function()
+		local i = table.find(self._handlers, fn)
+		if i then table.remove(self._handlers, i) end
+	end }
+end
+function Signal:Fire(...)
+	for _, fn in ipairs(table.clone(self._handlers)) do task.spawn(fn, ...) end
+end
+
+----------------------------------------------------------------------
+-- Remotes
+----------------------------------------------------------------------
+local function getRemote(name: string): RemoteEvent
+	local folder = ReplicatedStorage:FindFirstChild("Remotes")
+	if not folder then
+		folder = Instance.new("Folder")
+		folder.Name = "Remotes"
+		folder.Parent = ReplicatedStorage
+	end
+	local r = folder:FindFirstChild(name)
+	if not r then
+		r = Instance.new("RemoteEvent")
+		r.Name = name
+		r.Parent = folder
+	end
+	return r
+end
+
+local CombatRequest = getRemote("CombatRequest")  -- C->S intent
+local CombatFX = getRemote("CombatFX")            -- S->all cosmetic events
+local KnockbackRemote = getRemote("Knockback")    -- S->owner, applies velocity on client-owned root
+
+----------------------------------------------------------------------
+-- Service
+----------------------------------------------------------------------
+local CombatService = {}
+CombatService.HitLanded = Signal.new()   -- (attacker, target, hitData, damage)
+CombatService.Blocked = Signal.new()     -- (attacker, target, hitData)
+CombatService.Parried = Signal.new()     -- (attacker, defender)
+CombatService.GuardBroken = Signal.new() -- (attacker, target)
+
+local STUN_STATES = { Hitstun = true, Blockstun = true, ParryStunned = true, GuardBroken = true }
+local ATTACK_STATES = {
+	M1Startup = true, M1Active = true, M1Recovery = true,
+	TechStartup = true, TechActive = true, TechRecovery = true,
+}
+
+local entities = {} -- [Model] = entity record
+local VALID_ACTIONS = { M1 = true, BlockStart = true, BlockEnd = true }
+
+local now = os.clock
+
+----------------------------------------------------------------------
+-- Entity bookkeeping
+----------------------------------------------------------------------
+local function newEntity(model: Model)
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	local root = model:FindFirstChild("HumanoidRootPart")
+	if not humanoid or not root then return nil end
+
+	local e = {
+		model = model,
+		humanoid = humanoid,
+		root = root,
+		player = Players:GetPlayerFromCharacter(model),
+
+		state = "Idle",
+		token = 0,            -- incremented on every state change; old timers check it and do nothing
+		stateEndsAt = 0,
+
+		chainIndex = 0,
+		chainExpiresAt = 0,
+		chainLockedUntil = 0,
+		buffered = false,
+
+		blockStartedAt = 0,
+		parryEligible = false,
+		parryLockoutUntil = 0,
+		blockHeld = false,
+
+		guard = FrameData.Block.maxGuard,
+		lastGuardHitAt = 0,
+
+		baseWalkSpeed = humanoid.WalkSpeed,
+		baseJumpPower = humanoid.JumpPower,
+		baseJumpHeight = humanoid.JumpHeight,
+
+		lastRequestAt = 0,
+		connections = {},
+	}
+
+	table.insert(e.connections, humanoid.Died:Connect(function()
+		CombatService:UnregisterEntity(model)
+	end))
+	table.insert(e.connections, model.AncestryChanged:Connect(function(_, parent)
+		if not parent then CombatService:UnregisterEntity(model) end
+	end))
+
+	if e.player and model:GetAttribute("Faction") == nil then model:SetAttribute("Faction", "Sorcerer") end
+	model:SetAttribute("CombatState", "Idle")
+	model:SetAttribute("Guard", e.guard)
+	return e
+end
+
+function CombatService:RegisterEntity(model: Model)
+	if entities[model] then return entities[model] end
+	local e = newEntity(model)
+	entities[model] = e
+	return e
+end
+
+function CombatService:UnregisterEntity(model: Model)
+	local e = entities[model]
+	if not e then return end
+	e.token += 1
+	for _, c in ipairs(e.connections) do c:Disconnect() end
+	entities[model] = nil
+end
+
+local function getEntity(model)
+	if not model then return nil end
+	local e = entities[model]
+	if e and e.humanoid.Health > 0 and e.root.Parent then return e end
+	return nil
+end
+
+----------------------------------------------------------------------
+-- Movement and state
+----------------------------------------------------------------------
+local function applyMovement(e)
+	local h = e.humanoid
+	local s = e.state
+	local canJump = true
+	if STUN_STATES[s] then
+		h.WalkSpeed = FrameData.Movement.stunWalkSpeed
+		canJump = false
+	elseif ATTACK_STATES[s] then
+		h.WalkSpeed = e.baseWalkSpeed * FrameData.Movement.attackWalkSpeedMultiplier
+		canJump = false
+	elseif s == "Blocking" then
+		h.WalkSpeed = e.baseWalkSpeed * FrameData.Block.walkSpeedMultiplier
+		canJump = false
+	else
+		h.WalkSpeed = e.baseWalkSpeed
+	end
+	if h.UseJumpPower then
+		h.JumpPower = canJump and e.baseJumpPower or 0
+	else
+		h.JumpHeight = canJump and e.baseJumpHeight or 0
+	end
+end
+
+-- Switches to a new state. If a frame count is given, onExpire runs when it ends,
+-- unless the state was changed again in the meantime.
+local function setState(e, state: string, frames: number?, onExpire: (() -> ())?)
+	e.token += 1
+	local myToken = e.token
+	e.state = state
+	e.model:SetAttribute("CombatState", state)
+	applyMovement(e)
+
+	if frames then
+		e.stateEndsAt = now() + F(frames)
+		task.delay(F(frames), function()
+			if e.token ~= myToken or entities[e.model] ~= e then return end
+			if onExpire then
+				onExpire()
+			else
+				setState(e, "Idle")
+			end
+		end)
+	else
+		e.stateEndsAt = math.huge
+	end
+	return myToken
+end
+
+local function toIdle(e)
+	setState(e, "Idle")
+	-- If the player is still holding block when a stun ends, raise the guard again (no parry window)
+	if e.blockHeld then
+		CombatService:_enterBlock(e, false)
+	end
+end
+
+function CombatService:IsActionable(model): boolean
+	local e = getEntity(model)
+	return e ~= nil and e.state == "Idle"
+end
+
+----------------------------------------------------------------------
+-- Hitbox
+----------------------------------------------------------------------
+----------------------------------------------------------------------
+-- Lag compensation
+--   Every Heartbeat we record each entity's root position (~1 s of history). When a PLAYER attacks,
+--   the hitbox also checks where each target was `rewind` seconds ago, which is roughly what that
+--   attacker saw on their screen. A target counts as hit if either its current parts OR its rewound
+--   position fall in the box. Rewind is capped (MAX_REWIND) so high-ping players can't hit targets
+--   that have long since moved away. NPC attackers live on the server and are never rewound.
+----------------------------------------------------------------------
+local HISTORY_SECONDS = 1.0
+local MAX_REWIND = 0.2
+local INTERP_DELAY = 0.05     -- Roblox's client-side interpolation delay, roughly
+local TARGET_HALF_EXTENTS = Vector3.new(1.5, 2.5, 1.5) -- approximate torso size, added to the box
+
+local function recordHistory(e)
+	local h = e.history
+	if not h then
+		h = {}
+		e.history = h
+	end
+	table.insert(h, { t = now(), pos = e.root.Position })
+	local cutoff = now() - HISTORY_SECONDS
+	while #h > 2 and h[1].t < cutoff do table.remove(h, 1) end
+end
+
+local function positionAt(e, t: number): Vector3
+	local h = e.history
+	if not h or #h == 0 then return e.root.Position end
+	if t <= h[1].t then return h[1].pos end
+	for i = #h, 2, -1 do
+		local a, b = h[i - 1], h[i]
+		if a.t <= t and t <= b.t then
+			local alpha = (b.t > a.t) and (t - a.t) / (b.t - a.t) or 0
+			return a.pos:Lerp(b.pos, alpha)
+		end
+	end
+	return e.root.Position
+end
+
+local function rewindFor(attacker): number
+	if not attacker.player then return 0 end
+	local ok, ping = pcall(function() return attacker.player:GetNetworkPing() end)
+	if not ok or type(ping) ~= "number" then return 0 end
+	return math.clamp(ping + INTERP_DELAY, 0, MAX_REWIND)
+end
+
+local function pointInBox(cf: CFrame, size: Vector3, p: Vector3): boolean
+	local rel = cf:PointToObjectSpace(p)
+	local half = size / 2 + TARGET_HALF_EXTENTS
+	return math.abs(rel.X) <= half.X and math.abs(rel.Y) <= half.Y and math.abs(rel.Z) <= half.Z
+end
+
+local function queryHitbox(e, box)
+	local params = OverlapParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { e.model }
+
+	local cf = e.root.CFrame * CFrame.new(0, 0, -box.offset)
+	local parts = workspace:GetPartBoundsInBox(cf, box.size, params)
+
+	local found = {}
+	for _, part in ipairs(parts) do
+		local model = part:FindFirstAncestorOfClass("Model")
+		if model and not found[model] and getEntity(model) then
+			found[model] = true
+		end
+	end
+
+	-- Also check rewound positions
+	local rewind = rewindFor(e)
+	if rewind > 0 then
+		local t = now() - rewind
+		for model, other in pairs(entities) do
+			if other ~= e and not found[model] and getEntity(model) and pointInBox(cf, box.size, positionAt(other, t)) then
+				found[model] = true
+			end
+		end
+	end
+	return found
+end
+
+----------------------------------------------------------------------
+-- Hit resolution (also used by techniques)
+----------------------------------------------------------------------
+local function flatUnit(v: Vector3): Vector3
+	local f = Vector3.new(v.X, 0, v.Z)
+	return f.Magnitude > 1e-3 and f.Unit or Vector3.zero
+end
+
+local function isFacing(defender, attacker): boolean
+	local toAttacker = flatUnit(attacker.root.Position - defender.root.Position)
+	local look = flatUnit(defender.root.CFrame.LookVector)
+	return look:Dot(toAttacker) > FrameData.Block.frontDot
+end
+
+local function applyVelocityTo(target, velocity: Vector3, duration: number)
+	local kb = { duration = duration }
+	-- Tell MovementGuard to expect this burst of speed (plus time for latency and landing)
+	target.model:SetAttribute("MoveGraceUntil", now() + duration + 0.75)
+	target.model:SetAttribute("MoveGraceSpeed", velocity.Magnitude)
+	if target.player then
+		-- The client owns its character's physics, so ask the owning client to apply the velocity.
+		-- The client's handler must apply exactly this vector (it has no say in the value).
+		KnockbackRemote:FireClient(target.player, velocity, kb.duration)
+	else
+		local att = target.root:FindFirstChild("KnockbackAttachment") or Instance.new("Attachment")
+		att.Name = "KnockbackAttachment"
+		att.Parent = target.root
+		local lv = Instance.new("LinearVelocity")
+		lv.Attachment0 = att
+		lv.MaxForce = math.huge
+		lv.VectorVelocity = velocity
+		lv.RelativeTo = Enum.ActuatorRelativeTo.World
+		lv.Parent = target.root
+		Debris:AddItem(lv, kb.duration)
+	end
+end
+
+local function applyKnockback(attacker, target, kb)
+	-- kb.outward pushes away from the attacker (area bursts); otherwise along the attacker's facing
+	local dir = kb.outward and flatUnit(target.root.Position - attacker.root.Position)
+		or flatUnit(attacker.root.CFrame.LookVector)
+	if dir == Vector3.zero then dir = flatUnit(attacker.root.CFrame.LookVector) end
+	applyVelocityTo(target, dir * kb.horizontal + Vector3.new(0, kb.vertical, 0), kb.duration)
+end
+
+local function applyStun(target, state: string, frames: number)
+	-- Combos refresh stun: keep whichever is longer, the remaining stun or the new one
+	if STUN_STATES[target.state] and target.state == state then
+		local remaining = (target.stateEndsAt - now()) * FrameData.FPS
+		frames = math.max(frames, remaining)
+	end
+	-- Being stunned cancels any attack in progress and drops the chain
+	target.chainIndex = 0
+	target.buffered = false
+	setState(target, state, frames, function() toIdle(target) end)
+end
+
+local function damageGuard(attacker, target, amount)
+	target.guard = math.max(0, target.guard - amount)
+	target.lastGuardHitAt = now()
+	target.model:SetAttribute("Guard", target.guard)
+	if target.guard <= 0 then
+		target.guard = FrameData.Block.maxGuard * 0.5 -- comes back half full after the break
+		target.model:SetAttribute("Guard", target.guard)
+		applyStun(target, "GuardBroken", FrameData.Block.guardBreakStun)
+		CombatFX:FireAllClients("GuardBreak", attacker.model, target.model)
+		CombatService.GuardBroken:Fire(attacker.model, target.model)
+		return true
+	end
+	return false
+end
+
+--[[
+	hitData fields: damage, hitstun, blockstun, guardDamage, knockback?, unblockable?, unparryable?
+	Returns "Hit" | "Blocked" | "Parried" | "GuardBroken" | nil
+]]
+function CombatService:ApplyHit(attackerModel, targetModel, hitData)
+	local attacker = getEntity(attackerModel)
+	local target = getEntity(targetModel)
+	if not attacker or not target or attacker == target then return nil end
+
+	-- Factions: entities on the same side can't hit each other (players, wards and civilians are all
+	-- "Sorcerer"; enemies are "Curse"), unless both have PvPEnabled set (sparring ring).
+	local fa, ft = attacker.model:GetAttribute("Faction"), target.model:GetAttribute("Faction")
+	if fa ~= nil and fa == ft and not (attacker.model:GetAttribute("PvPEnabled") and target.model:GetAttribute("PvPEnabled")) then
+		return nil
+	end
+
+	-- Block and parry
+	if target.state == "Blocking" and not hitData.unblockable and isFacing(target, attacker) then
+		local inParry = target.parryEligible
+			and not hitData.unparryable
+			and (now() - target.blockStartedAt) <= F(FrameData.Block.parryWindow)
+
+		if inParry then
+			target.parryEligible = false
+			attacker.chainIndex = 0
+			applyStun(attacker, "ParryStunned", FrameData.Parry.attackerStun)
+			-- The defender is free to act right away
+			setState(target, "Idle")
+			if target.blockHeld then self:_enterBlock(target, false) end
+			CombatFX:FireAllClients("Parry", attacker.model, target.model)
+			self.Parried:Fire(attacker.model, target.model)
+			return "Parried"
+		end
+
+		if damageGuard(attacker, target, hitData.guardDamage or 0) then
+			return "GuardBroken"
+		end
+		-- Blockstun, then go back to blocking if the button is still held
+		setState(target, "Blockstun", hitData.blockstun or 8, function()
+			setState(target, "Idle")
+			if target.blockHeld then self:_enterBlock(target, false) end
+		end)
+		CombatFX:FireAllClients("Block", attacker.model, target.model)
+		self.Blocked:Fire(attacker.model, target.model, hitData)
+		return "Blocked"
+	end
+
+	-- Clean hit
+	-- Multipliers come from server-set attributes (Progression stats, Domain buffs)
+	local damage = (hitData.damage or 0)
+		* (attacker.model:GetAttribute("DamageMult") or 1)
+		* (attacker.model:GetAttribute("DomainDamageMult") or 1)
+		* (target.model:GetAttribute("DamageTakenMult") or 1)
+	if target.model:GetAttribute("Invulnerable") then damage = 0 end
+	target.humanoid:TakeDamage(damage)
+
+	-- SuperArmor (e.g. while casting a Domain): takes damage but isn't stunned or knocked back
+	local armored = target.model:GetAttribute("SuperArmor") == true
+	if not armored then
+		applyStun(target, "Hitstun", hitData.hitstun or 0)
+	end
+
+	if hitData.knockback and not armored then
+		applyKnockback(attacker, target, hitData.knockback)
+	end
+
+	CombatFX:FireAllClients("Hit", attacker.model, target.model, hitData.name)
+	self.HitLanded:Fire(attacker.model, target.model, hitData, damage)
+	return "Hit"
+end
+
+----------------------------------------------------------------------
+-- M1 chain
+----------------------------------------------------------------------
+local function runActiveFrames(e, hit, token)
+	-- Check the hitbox every Heartbeat for the whole active window; each target is hit at most once per swing
+	local alreadyHit = {}
+	local endsAt = now() + F(hit.active)
+	local conn
+	conn = RunService.Heartbeat:Connect(function()
+		if e.token ~= token or now() >= endsAt or not getEntity(e.model) then
+			conn:Disconnect()
+			return
+		end
+		for model in pairs(queryHitbox(e, hit.hitbox)) do
+			if not alreadyHit[model] then
+				alreadyHit[model] = true
+				CombatService:ApplyHit(e.model, model, hit)
+				-- If a parry stunned us, the token changed; stop swinging
+				if e.token ~= token then
+					conn:Disconnect()
+					return
+				end
+			end
+		end
+	end)
+end
+
+function CombatService:_startM1(e, index: number)
+	local chain = FrameData.M1
+	local hit = chain[index]
+	e.chainIndex = index
+	e.buffered = false
+
+	setState(e, "M1Startup", hit.startup, function()
+		local activeToken = setState(e, "M1Active", hit.active, function()
+			setState(e, "M1Recovery", hit.recovery, function()
+				local isFinisher = index >= #chain
+				if isFinisher then
+					e.chainIndex = 0
+					e.chainLockedUntil = now() + F(FrameData.Chain.finisherCooldown)
+				else
+					e.chainExpiresAt = now() + F(FrameData.Chain.resetWindow)
+				end
+
+				if e.buffered and not isFinisher then
+					self:_startM1(e, index + 1)
+				else
+					e.buffered = false
+					toIdle(e)
+				end
+			end)
+		end)
+		runActiveFrames(e, hit, activeToken)
+	end)
+
+	CombatFX:FireAllClients("M1", e.model, index)
+end
+
+function CombatService:_requestM1(e)
+	local t = now()
+
+	if e.state == "M1Recovery" then
+		-- Queue the next hit if the press lands in the buffer window at the end of recovery
+		if (e.stateEndsAt - t) <= F(FrameData.Chain.bufferWindow) then
+			e.buffered = true
+		end
+		return
+	end
+	if e.state ~= "Idle" then return end
+	if t < e.chainLockedUntil then return end
+
+	local nextIndex = 1
+	if e.chainIndex > 0 and t <= e.chainExpiresAt then
+		nextIndex = e.chainIndex + 1
+	end
+	if nextIndex > #FrameData.M1 then nextIndex = 1 end
+	self:_startM1(e, nextIndex)
+end
+
+----------------------------------------------------------------------
+-- Block / parry
+----------------------------------------------------------------------
+function CombatService:_enterBlock(e, allowParry: boolean)
+	local t = now()
+	e.blockStartedAt = t
+	e.parryEligible = allowParry and t >= e.parryLockoutUntil
+	e.chainIndex = 0
+	setState(e, "Blocking")
+end
+
+function CombatService:_requestBlockStart(e)
+	e.blockHeld = true
+	if e.state ~= "Idle" then return end -- the guard goes back up after stun or recovery ends, if still held
+	self:_enterBlock(e, true)
+end
+
+function CombatService:_requestBlockEnd(e)
+	e.blockHeld = false
+	if e.state ~= "Blocking" then return end
+	-- Dropping block before a parry happened puts the parry window on cooldown (stops spamming block to fish for parries)
+	if e.parryEligible then
+		e.parryLockoutUntil = now() + F(FrameData.Block.parryLockout)
+	end
+	e.parryEligible = false
+	setState(e, "BlockRecovery", FrameData.Block.releaseRecovery, function() toIdle(e) end)
+end
+
+----------------------------------------------------------------------
+-- Public action API (used by TechniqueRegistry)
+----------------------------------------------------------------------
+--[[
+	Runs a startup -> active -> recovery action on an Idle entity.
+	phases = { startup = f, active = f, recovery = f,
+	           onActive = function(isValid) end,   -- runs at the start of active frames
+	           onEnd = function() end }            -- runs only if the action finished without interruption
+	isValid() returns false once the action has been interrupted (stunned, parried, died).
+	Returns false if the entity isn't actionable.
+]]
+function CombatService:RunAction(model, phases): boolean
+	local e = getEntity(model)
+	if not e or e.state ~= "Idle" then return false end
+	e.chainIndex = 0
+	e.buffered = false
+
+	setState(e, "TechStartup", phases.startup, function()
+		local activeToken
+		activeToken = setState(e, "TechActive", phases.active, function()
+			setState(e, "TechRecovery", phases.recovery, function()
+				toIdle(e)
+				if phases.onEnd then phases.onEnd() end
+			end)
+		end)
+		if phases.onActive then
+			local function isValid()
+				return entities[e.model] == e and (e.token == activeToken or e.state == "TechRecovery")
+			end
+			task.spawn(phases.onActive, isValid)
+		end
+	end)
+	return true
+end
+
+-- Inputs for server-driven entities (NPC curses). They go through the same rules as players.
+function CombatService:RequestM1(model)
+	local e = getEntity(model)
+	if e then self:_requestM1(e) end
+end
+
+function CombatService:SetBlocking(model, held: boolean)
+	local e = getEntity(model)
+	if not e then return end
+	if held then self:_requestBlockStart(e) else self:_requestBlockEnd(e) end
+end
+
+function CombatService:GetState(model): string?
+	local e = getEntity(model)
+	return e and e.state
+end
+
+-- Box hitbox query relative to the entity's root (for techniques). Returns a set of target models.
+function CombatService:QueryBox(model, size: Vector3, offset: number)
+	local e = getEntity(model)
+	if not e then return {} end
+	return queryHitbox(e, { size = size, offset = offset })
+end
+
+function CombatService:GetRoot(model)
+	local e = getEntity(model)
+	return e and e.root
+end
+
+function CombatService:IsPlayerEntity(model)
+	local e = getEntity(model)
+	return e ~= nil and e.player ~= nil, e and e.player
+end
+
+-- Server-chosen velocity applied by whoever owns the physics (used for dashes)
+function CombatService:ApplyVelocity(model, velocity: Vector3, duration: number)
+	local e = getEntity(model)
+	if not e then return end
+	applyVelocityTo(e, velocity, duration)
+end
+
+----------------------------------------------------------------------
+-- Remote handling (all input is treated as untrusted)
+----------------------------------------------------------------------
+local function onCombatRequest(player: Player, action)
+	if typeof(action) ~= "string" or not VALID_ACTIONS[action] then return end
+
+	local character = player.Character
+	if not character then return end
+	local e = getEntity(character) or (entities[character] == nil and CombatService:RegisterEntity(character))
+	if not e or e.humanoid.Health <= 0 then return end
+
+	-- Rate limit. BlockEnd is always accepted so a release is never lost.
+	local t = now()
+	if action ~= "BlockEnd" then
+		if t - e.lastRequestAt < FrameData.Network.minRequestInterval then return end
+		e.lastRequestAt = t
+	end
+
+	if action == "M1" then
+		CombatService:_requestM1(e)
+	elseif action == "BlockStart" then
+		CombatService:_requestBlockStart(e)
+	elseif action == "BlockEnd" then
+		CombatService:_requestBlockEnd(e)
+	end
+end
+
+----------------------------------------------------------------------
+-- Guard regen
+----------------------------------------------------------------------
+local function onHeartbeat(dt: number)
+	local t = now()
+	for _, e in pairs(entities) do
+		if e.root.Parent then recordHistory(e) end
+	end
+	local regenDelay = F(FrameData.Block.guardRegenDelay)
+	local maxGuard = FrameData.Block.maxGuard
+	for _, e in pairs(entities) do
+		if e.guard < maxGuard and e.state ~= "Blocking" and e.state ~= "Blockstun"
+			and t - e.lastGuardHitAt >= regenDelay then
+			e.guard = math.min(maxGuard, e.guard + FrameData.Block.guardRegenPerSecond * dt)
+			e.model:SetAttribute("Guard", math.floor(e.guard))
+		end
+	end
+end
+
+----------------------------------------------------------------------
+-- Lifecycle
+----------------------------------------------------------------------
+function CombatService:Init()
+	CombatRequest.OnServerEvent:Connect(onCombatRequest)
+	RunService.Heartbeat:Connect(onHeartbeat)
+
+	local function hookPlayer(player)
+		player.CharacterAdded:Connect(function(char)
+			char:WaitForChild("HumanoidRootPart")
+			char:WaitForChild("Humanoid")
+			self:RegisterEntity(char)
+		end)
+		if player.Character then task.spawn(function() self:RegisterEntity(player.Character) end) end
+	end
+	Players.PlayerAdded:Connect(hookPlayer)
+	for _, p in ipairs(Players:GetPlayers()) do hookPlayer(p) end
+end
+
+return CombatService
