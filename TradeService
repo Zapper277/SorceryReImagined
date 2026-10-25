@@ -1,0 +1,332 @@
+--!nonstrict
+--[[
+	TradeService  (ServerScriptService/Services/TradeService)
+	HEXBOUND - player-to-player trading between two players on the same server, where everything is swapped in one step or not at all.
+
+	Flow:
+	  A: ("Request", targetUserId)       -> B gets ("Incoming", A.UserId)
+	  B: ("Accept", fromUserId)          -> session opens for both ("Opened", partnerUserId)
+	  either: ("SetOffer", { uids }, marks) -> replaces your offer and un-readies BOTH players
+	  either: ("Ready", true/false)
+	  both ready -> 3s countdown ("Countdown", 3); any change during it cancels the countdown
+	  countdown ends -> every item is checked again -> swap -> both profiles saved -> ("Completed")
+	  either: ("Cancel")
+
+	Anti-dupe / anti-scam:
+	  * Offered items are locked in InventoryService (can't be used, equipped or discarded).
+	  * The final swap checks ownership, quantity, tradeable flag and inventory space again.
+	  * Changing an offer resets both ready states and the countdown.
+	  * Both profiles are saved immediately after the swap. Session locks stop the same profile being loaded on another server.
+	  * Requirements: minimum level, both players alive, neither in a mission. Requests are rate-limited.
+
+	Remote TradeRequest (C->S), TradeUpdate (S->C: event, payload)
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local ItemData = require(ReplicatedStorage.Shared.ItemData)
+local Services = ServerScriptService.Services
+local PlayerDataService = require(Services.PlayerDataService)
+local InventoryService = require(Services.InventoryService)
+local ProgressionService = require(Services.ProgressionService)
+local RollService = require(Services.RollService)
+
+local Remotes = ReplicatedStorage.Remotes
+local function remote(name)
+	local r = Remotes:FindFirstChild(name) or Instance.new("RemoteEvent")
+	r.Name = name
+	r.Parent = Remotes
+	return r
+end
+local TradeRequest = remote("TradeRequest")
+local TradeUpdate = remote("TradeUpdate")
+
+local CONFIG = {
+	minLevel = 5,
+	maxItemsPerSide = 8,
+	maxMarks = 1_000_000,
+	countdown = 3,
+	requestExpiry = 30,
+	requestCooldown = 5,
+}
+
+local TradeService = {}
+local sessions = {}      -- [Player] = session (both players point to the same session)
+local pending = {}       -- [target] = { [from] = expiresAt }
+local lastRequest = {}
+
+-- Other services can block trading (MissionService registers one)
+TradeService.BlockChecks = {}
+
+local function send(player, event, payload)
+	if player and player.Parent then TradeUpdate:FireClient(player, event, payload) end
+end
+
+local function canTrade(player)
+	local data = PlayerDataService:GetProfile(player)
+	if not data then return false, "NoProfile" end
+	if data.level < CONFIG.minLevel then return false, "LevelTooLow" end
+	local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+	if not hum or hum.Health <= 0 then return false, "Dead" end
+	for _, check in ipairs(TradeService.BlockChecks) do
+		local blocked, reason = check(player)
+		if blocked then return false, reason end
+	end
+	return true
+end
+
+function TradeService:IsTrading(player) return sessions[player] ~= nil end
+
+----------------------------------------------------------------------
+-- Session helpers
+----------------------------------------------------------------------
+local function unlockOffer(player, offer)
+	for _, uid in ipairs(offer.uids) do InventoryService:Lock(player, uid, false) end
+end
+
+local function publicOffer(player, offer)
+	local list = {}
+	for _, uid in ipairs(offer.uids) do
+		local e = InventoryService:GetEntry(player, uid)
+		if e then table.insert(list, { uid = uid, id = e.id, qty = e.qty }) end
+	end
+	return { items = list, marks = offer.marks }
+end
+
+local function broadcastState(s)
+	local payload = {
+		[tostring(s.a.UserId)] = { offer = publicOffer(s.a, s.offers[s.a]), ready = s.ready[s.a] },
+		[tostring(s.b.UserId)] = { offer = publicOffer(s.b, s.offers[s.b]), ready = s.ready[s.b] },
+	}
+	send(s.a, "State", payload)
+	send(s.b, "State", payload)
+end
+
+local function closeSession(s, reason)
+	if s.closed then return end
+	s.closed = true
+	unlockOffer(s.a, s.offers[s.a])
+	unlockOffer(s.b, s.offers[s.b])
+	sessions[s.a] = nil
+	sessions[s.b] = nil
+	send(s.a, "Closed", reason)
+	send(s.b, "Closed", reason)
+end
+
+local function resetReady(s)
+	s.ready[s.a] = false
+	s.ready[s.b] = false
+	s.countdownToken += 1
+end
+
+----------------------------------------------------------------------
+-- Final checks and the swap
+----------------------------------------------------------------------
+local function validateOffer(player, offer)
+	local data = PlayerDataService:GetProfile(player)
+	if not data then return false end
+	if data.currency.Marks < offer.marks then return false end
+	local seen = {}
+	for _, uid in ipairs(offer.uids) do
+		if seen[uid] then return false end
+		seen[uid] = true
+		local e = InventoryService:GetEntry(player, uid)
+		if not e then return false end
+		local def = ItemData.Items[e.id]
+		if not def or not def.tradeable then return false end
+	end
+	return true
+end
+
+-- Checks whether the receiver has room. Simplified: each incoming entry may need a new slot.
+local function hasRoom(receiver, incomingCount, outgoingCount)
+	local data = PlayerDataService:GetProfile(receiver)
+	return #data.inventory - outgoingCount + incomingCount <= ItemData.MaxInventorySlots
+end
+
+local function executeTrade(s)
+	local a, b = s.a, s.b
+	local oa, ob = s.offers[a], s.offers[b]
+	if not (canTrade(a) and canTrade(b)) then return closeSession(s, "Ineligible") end
+	if not validateOffer(a, oa) or not validateOffer(b, ob) then return closeSession(s, "OfferInvalid") end
+	if not hasRoom(a, #ob.uids, #oa.uids) or not hasRoom(b, #oa.uids, #ob.uids) then
+		return closeSession(s, "InventoryFull")
+	end
+
+	local da, db = PlayerDataService:GetProfile(a), PlayerDataService:GetProfile(b)
+
+	-- Move whole entries (same uid) between the two inventory arrays. No yielding happens between these steps.
+	local function moveEntries(fromData, toData, from, uids)
+		for _, uid in ipairs(uids) do
+			for i, e in ipairs(fromData.inventory) do
+				if e.uid == uid then
+					table.remove(fromData.inventory, i)
+					for slot, eq in pairs(fromData.equipped) do
+						if eq == uid then fromData.equipped[slot] = nil end
+					end
+					InventoryService:Lock(from, uid, false)
+					table.insert(toData.inventory, e)
+					break
+				end
+			end
+		end
+	end
+	moveEntries(da, db, a, oa.uids)
+	moveEntries(db, da, b, ob.uids)
+	da.currency.Marks += ob.marks - oa.marks
+	db.currency.Marks += oa.marks - ob.marks
+
+	print(("[Trade] %d <-> %d | A gave %d items + %d Marks | B gave %d items + %d Marks")
+		:format(a.UserId, b.UserId, #oa.uids, oa.marks, #ob.uids, ob.marks))
+
+	oa.uids, ob.uids = {}, {}
+	s.closed = true
+	sessions[a], sessions[b] = nil, nil
+
+	for _, p in ipairs({ a, b }) do
+		PlayerDataService:MarkDirty(p)
+		task.spawn(function() PlayerDataService:SaveNow(p) end)
+		InventoryService:Sync(p)
+		ProgressionService:Apply(p)
+		send(p, "Completed")
+	end
+end
+
+local function startCountdown(s)
+	s.countdownToken += 1
+	local token = s.countdownToken
+	send(s.a, "Countdown", CONFIG.countdown)
+	send(s.b, "Countdown", CONFIG.countdown)
+	task.delay(CONFIG.countdown, function()
+		if s.closed or s.countdownToken ~= token then return end
+		if s.ready[s.a] and s.ready[s.b] then executeTrade(s) end
+	end)
+end
+
+----------------------------------------------------------------------
+-- Request handling
+----------------------------------------------------------------------
+local handlers = {}
+
+handlers.Request = function(player, targetUserId)
+	if type(targetUserId) ~= "number" then return end
+	local target = Players:GetPlayerByUserId(targetUserId)
+	if not target or target == player then return end
+	local t = os.clock()
+	if t - (lastRequest[player] or 0) < CONFIG.requestCooldown then return end
+	lastRequest[player] = t
+	if sessions[player] or sessions[target] then return send(player, "Error", "Busy") end
+	local ok, reason = canTrade(player)
+	if not ok then return send(player, "Error", reason) end
+	ok, reason = canTrade(target)
+	if not ok then return send(player, "Error", "TargetIneligible") end
+
+	pending[target] = pending[target] or {}
+	pending[target][player] = t + CONFIG.requestExpiry
+	send(target, "Incoming", player.UserId)
+end
+
+handlers.Accept = function(player, fromUserId)
+	if type(fromUserId) ~= "number" then return end
+	local from = Players:GetPlayerByUserId(fromUserId)
+	local list = pending[player]
+	if not from or not list or not list[from] or os.clock() > list[from] then return end
+	list[from] = nil
+	if sessions[player] or sessions[from] then return end
+	if not (canTrade(player) and canTrade(from)) then return end
+
+	local s = {
+		a = from, b = player,
+		offers = { [from] = { uids = {}, marks = 0 }, [player] = { uids = {}, marks = 0 } },
+		ready = { [from] = false, [player] = false },
+		countdownToken = 0,
+		closed = false,
+	}
+	sessions[from], sessions[player] = s, s
+	send(from, "Opened", player.UserId)
+	send(player, "Opened", from.UserId)
+	broadcastState(s)
+end
+
+handlers.Decline = function(player, fromUserId)
+	local from = type(fromUserId) == "number" and Players:GetPlayerByUserId(fromUserId)
+	if from and pending[player] then pending[player][from] = nil; send(from, "Error", "Declined") end
+end
+
+handlers.SetOffer = function(player, uids, marks)
+	local s = sessions[player]
+	if not s or s.closed or type(uids) ~= "table" then return end
+	marks = (type(marks) == "number" and marks == marks) and math.clamp(math.floor(marks), 0, CONFIG.maxMarks) or 0
+
+	local data = PlayerDataService:GetProfile(player)
+	if marks > data.currency.Marks then return send(player, "Error", "NotEnoughMarks") end
+
+	local clean, seen = {}, {}
+	for i, uid in ipairs(uids) do
+		if i > CONFIG.maxItemsPerSide then break end
+		if type(uid) == "string" and not seen[uid] then
+			local e = InventoryService:GetEntry(player, uid)
+			local def = e and ItemData.Items[e.id]
+			if def and def.tradeable then
+				seen[uid] = true
+				table.insert(clean, uid)
+			end
+		end
+	end
+
+	unlockOffer(player, s.offers[player])
+	s.offers[player] = { uids = clean, marks = marks }
+	for _, uid in ipairs(clean) do InventoryService:Lock(player, uid, true) end
+	resetReady(s)
+	broadcastState(s)
+end
+
+handlers.Ready = function(player, isReady)
+	local s = sessions[player]
+	if not s or s.closed then return end
+	s.ready[player] = isReady == true
+	if not s.ready[player] then s.countdownToken += 1 end
+	broadcastState(s)
+	if s.ready[s.a] and s.ready[s.b] then startCountdown(s) end
+end
+
+handlers.Cancel = function(player)
+	local s = sessions[player]
+	if s then closeSession(s, "Cancelled") end
+end
+
+local function onRequest(player, action, ...)
+	local h = type(action) == "string" and handlers[action]
+	if h then h(player, ...) end
+end
+
+function TradeService:Init()
+	TradeRequest.OnServerEvent:Connect(onRequest)
+	-- No rolling during a trade (the Lineage could change while you're offering)
+	table.insert(RollService.BlockChecks, function(p)
+		if sessions[p] then return true, "InTrade" end
+		return false
+	end)
+	Players.PlayerRemoving:Connect(function(p)
+		local s = sessions[p]
+		if s then closeSession(s, "PartnerLeft") end
+		pending[p] = nil
+		for _, list in pairs(pending) do list[p] = nil end
+		lastRequest[p] = nil
+	end)
+	-- Dying cancels the trade
+	local function hookChar(p)
+		p.CharacterAdded:Connect(function(char)
+			char:WaitForChild("Humanoid").Died:Connect(function()
+				local s = sessions[p]
+				if s then closeSession(s, "Died") end
+			end)
+		end)
+	end
+	Players.PlayerAdded:Connect(hookChar)
+	for _, p in ipairs(Players:GetPlayers()) do hookChar(p) end
+end
+
+return TradeService
