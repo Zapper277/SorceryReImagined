@@ -1,0 +1,167 @@
+--!nonstrict
+--[[
+	MovementGuard  (ServerScriptService/Services/MovementGuard)
+	HEXBOUND - checks player movement on the server.
+
+	Roblox gives each client control of its own character's physics, so movement is the one thing
+	the server can't decide directly. This service samples every character SAMPLE_INTERVAL seconds
+	and checks:
+	  * Speed:     horizontal speed vs WalkSpeed (with headroom), or server-issued knockback/dash speed
+	               during the "MoveGraceUntil" window set by CombatService.
+	  * Fly / up:  rising faster than a jump allows, or hovering with no ground below for too long.
+	  * Noclip:    moving through a solid anchored wall between two samples.
+	A violation sends the player back to their last valid position and adds a strike.
+	Strikes decay over time; reaching KICK_STRIKES kicks the player.
+
+	Server-side teleports must set the "TeleportGraceUntil" attribute on the character first
+	(MovementGuard:Teleport does this for you). Otherwise the teleport looks like a speed hack.
+
+	Tuning is deliberately lenient. False positives hurt legitimate players more than a few seconds of
+	cheating helps an exploiter. Watch the output in testing and tighten if needed.
+]]
+
+local Players = game:GetService("Players")
+
+local SAMPLE_INTERVAL = 0.2
+local SPEED_MULT = 1.5          -- allowed = WalkSpeed * mult + flat
+local SPEED_FLAT = 8
+local MAX_RISE_SPEED = 75       -- studs/s upward; a default jump peaks around 50
+local HOVER_TIME = 3.0          -- seconds above ground with no descent before it's flagged
+local GROUND_PROBE = 14         -- studs; ground must be within this distance below
+local STRIKE_DECAY = 10         -- seconds per strike that decays
+local KICK_STRIKES = 12
+local LOG = true
+
+local MovementGuard = {}
+local tracked = {} -- [Player] = state
+
+local now = os.clock
+
+function MovementGuard:Teleport(character: Model, cf: CFrame)
+	character:SetAttribute("TeleportGraceUntil", now() + 1.5)
+	character:PivotTo(cf)
+	local p = Players:GetPlayerFromCharacter(character)
+	if p and tracked[p] then tracked[p].lastValid = cf.Position end
+end
+
+local function rayParams(char)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local exclude = {}
+	for _, pl in ipairs(Players:GetPlayers()) do if pl.Character then table.insert(exclude, pl.Character) end end
+	table.insert(exclude, char)
+	params.FilterDescendantsInstances = exclude
+	params.RespectCanCollide = true
+	return params
+end
+
+local function flag(player, st, root, reason, detail)
+	st.strikes += 1
+	if LOG then
+		warn(("[MovementGuard] %s (%d): %s %s | strikes %d"):format(player.Name, player.UserId, reason, detail or "", st.strikes))
+	end
+	-- Send them back and zero their momentum
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.Parent:PivotTo(CFrame.new(st.lastValid) * root.CFrame.Rotation)
+	st.lastPos = st.lastValid
+	st.airSince = nil
+	if st.strikes >= KICK_STRIKES then
+		player:Kick("Unusual movement detected. If this is a mistake, please rejoin.")
+	end
+end
+
+local function check(player, st)
+	local char = player.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not root or not hum or hum.Health <= 0 or hum.SeatPart then
+		st.lastPos = nil
+		return
+	end
+
+	local t = now()
+	local pos = root.Position
+	-- Strike decay
+	if t - st.lastDecay >= STRIKE_DECAY then
+		st.strikes = math.max(0, st.strikes - 1)
+		st.lastDecay = t
+	end
+
+	if not st.lastPos or (char:GetAttribute("TeleportGraceUntil") or 0) > t then
+		st.lastPos, st.lastT, st.lastValid = pos, t, pos
+		st.airSince = nil
+		return
+	end
+
+	local dt = math.max(t - st.lastT, 1e-3)
+	local delta = pos - st.lastPos
+	local horiz = Vector3.new(delta.X, 0, delta.Z).Magnitude / dt
+	local rise = delta.Y / dt
+
+	local graceActive = (char:GetAttribute("MoveGraceUntil") or 0) > t
+	local allowed = hum.WalkSpeed * SPEED_MULT + SPEED_FLAT
+	if graceActive then
+		allowed = math.max(allowed, (char:GetAttribute("MoveGraceSpeed") or 0) * 1.3 + SPEED_FLAT)
+	end
+
+	-- 1. Speed
+	if horiz > allowed then
+		return flag(player, st, root, "Speed", ("%.0f > %.0f"):format(horiz, allowed))
+	end
+
+	-- 2. Rising too fast
+	if rise > MAX_RISE_SPEED and not graceActive then
+		return flag(player, st, root, "Rise", ("%.0f"):format(rise))
+	end
+
+	-- 3. Noclip: a solid wall between the last sample and this one (only checked for real movement)
+	if delta.Magnitude > 3 then
+		local hit = workspace:Raycast(st.lastPos, delta, rayParams(char))
+		if hit and hit.Instance.Anchored and math.abs(hit.Normal.Y) < 0.3 and hit.Instance.Transparency < 1 then
+			return flag(player, st, root, "Noclip", hit.Instance:GetFullName())
+		end
+	end
+
+	-- 4. Hovering: no ground below and not falling
+	local ground = workspace:Raycast(pos, Vector3.new(0, -GROUND_PROBE, 0), rayParams(char))
+	if ground then
+		st.airSince = nil
+	elseif delta.Y >= -0.5 and not graceActive then
+		st.airSince = st.airSince or t
+		if t - st.airSince > HOVER_TIME then
+			return flag(player, st, root, "Hover", "")
+		end
+	else
+		st.airSince = nil -- falling normally
+	end
+
+	st.lastPos, st.lastT = pos, t
+	-- Only grounded positions count as a valid place to send someone back to
+	if ground then st.lastValid = pos end
+end
+
+function MovementGuard:Init()
+	local function add(p)
+		tracked[p] = { strikes = 0, lastDecay = now(), lastPos = nil, lastT = 0, lastValid = Vector3.zero, airSince = nil }
+		p.CharacterAdded:Connect(function(char)
+			char:SetAttribute("TeleportGraceUntil", now() + 3) -- spawning counts as a teleport
+			local st = tracked[p]
+			if st then st.lastPos = nil end
+		end)
+	end
+	Players.PlayerAdded:Connect(add)
+	for _, p in ipairs(Players:GetPlayers()) do add(p) end
+	Players.PlayerRemoving:Connect(function(p) tracked[p] = nil end)
+
+	task.spawn(function()
+		while true do
+			task.wait(SAMPLE_INTERVAL)
+			for p, st in pairs(tracked) do
+				local ok, err = pcall(check, p, st)
+				if not ok then warn("[MovementGuard]", err) end
+			end
+		end
+	end)
+end
+
+return MovementGuard
