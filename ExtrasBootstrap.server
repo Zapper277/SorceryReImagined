@@ -1,0 +1,33 @@
+-- ExtrasBootstrap (Script, ServerScriptService)  -> name it "ExtrasBootstrap" as a regular Script
+-- Starts the new services from this batch WITHOUT touching your existing ServerBootstrap.
+-- If you'd rather have one bootstrap, move these names into ServerBootstrap's list and delete this script.
+
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local NEW_SERVICES = {
+	"ClientBridgeService", "PartyService", "LagCompensation", "AdminCommands",
+	"NPCService", "ShopService", "SettingsService", "LeaderboardService", "TutorialService",
+}
+
+local loaded = {}
+for _, name in NEW_SERVICES do
+	local m = ServerScriptService:FindFirstChild(name)
+	if not m then warn("[ExtrasBootstrap] missing ModuleScript: " .. name) continue end
+	local ok, mod = pcall(require, m)
+	if not ok then warn("[ExtrasBootstrap] require failed for " .. name .. ": " .. tostring(mod)) continue end
+	if type(mod.Init) == "function" then
+		local ok2, err = pcall(mod.Init)
+		if not ok2 then warn("[ExtrasBootstrap] " .. name .. ".Init: " .. tostring(err)) end
+	end
+	loaded[name] = mod
+end
+for _, name in NEW_SERVICES do
+	local mod = loaded[name]
+	if mod and type(mod.Start) == "function" then
+		task.spawn(function()
+			local ok, err = pcall(mod.Start)
+			if not ok then warn("[ExtrasBootstrap] " .. name .. ".Start: " .. tostring(err)) end
+		end)
+	end
+end
+print("[ExtrasBootstrap] started:", table.concat(NEW_SERVICES, ", "))
