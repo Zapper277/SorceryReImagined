@@ -1,0 +1,90 @@
+--!strict
+-- Remotes (ModuleScript, ReplicatedStorage)
+-- Single source of truth for the NEW UI/party/effects remotes added in this batch.
+-- ASSUMPTION: Uses its own folder "HexUIRemotes" so it can't collide with whatever
+-- remotes your ServerBootstrap/CombatService already create.
+
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local FOLDER_NAME = "HexUIRemotes"
+
+local EVENTS = {
+	-- Server -> Client
+	"InventorySync", "MissionSync", "LineageSync", "TradeUpdate", "TradeIncoming",
+	"PartySync", "PartyInvite", "DomainCast", "PlayVFX", "PlaySound", "Notify",
+	"DialogueShow", "DialogueClose", "ShopOpen", "CurrencySync",
+	-- Client -> Server
+	"InventoryAction", "MissionAction", "TradeAction", "PartyAction", "AdminCommand",
+	"DialogueChoice", "SettingsSave", "TutorialStep",
+}
+
+local FUNCTIONS = {
+	"RequestSnapshot", -- client asks for full inventory/missions/lineage state on load
+	"RollLineage",     -- returns roll result
+	"ShopTransaction", -- buy/sell, returns { Ok, Reason, Currency }
+	"GetSettings",     -- returns saved settings table
+	"GetTutorialState", -- returns { Done = bool, Step = number }
+}
+
+local Remotes = {}
+local folder: Folder? = nil
+
+local function getFolder(): Folder
+	if folder then return folder end
+	if RunService:IsServer() then
+		local f = ReplicatedStorage:FindFirstChild(FOLDER_NAME) :: Folder?
+		if not f then
+			local newF = Instance.new("Folder")
+			newF.Name = FOLDER_NAME
+			newF.Parent = ReplicatedStorage
+			f = newF
+		end
+		for _, n in EVENTS do
+			if not (f :: Folder):FindFirstChild(n) then
+				local r = Instance.new("RemoteEvent"); r.Name = n; r.Parent = f
+			end
+		end
+		for _, n in FUNCTIONS do
+			if not (f :: Folder):FindFirstChild(n) then
+				local r = Instance.new("RemoteFunction"); r.Name = n; r.Parent = f
+			end
+		end
+		folder = f
+	else
+		folder = ReplicatedStorage:WaitForChild(FOLDER_NAME) :: Folder
+	end
+	return folder :: Folder
+end
+
+function Remotes.Event(name: string): RemoteEvent
+	assert(table.find(EVENTS, name), "Unknown remote event: " .. name)
+	return getFolder():WaitForChild(name) :: RemoteEvent
+end
+
+function Remotes.Function(name: string): RemoteFunction
+	assert(table.find(FUNCTIONS, name), "Unknown remote function: " .. name)
+	return getFolder():WaitForChild(name) :: RemoteFunction
+end
+
+-- Server-only token-bucket rate limiter. Returns true if the call is allowed.
+local buckets: { [Player]: { [string]: { tokens: number, last: number } } } = {}
+function Remotes.RateLimit(player: Player, key: string, perSecond: number, burst: number?): boolean
+	local cap = burst or perSecond
+	local pb = buckets[player]
+	if not pb then pb = {}; buckets[player] = pb end
+	local now = os.clock()
+	local b = pb[key]
+	if not b then b = { tokens = cap, last = now }; pb[key] = b end
+	b.tokens = math.min(cap, b.tokens + (now - b.last) * perSecond)
+	b.last = now
+	if b.tokens < 1 then return false end
+	b.tokens -= 1
+	return true
+end
+
+if RunService:IsServer() then
+	game:GetService("Players").PlayerRemoving:Connect(function(p) buckets[p] = nil end)
+end
+
+return Remotes
