@@ -1,0 +1,105 @@
+-- DialogueData (ModuleScript, ReplicatedStorage)
+-- NPC definitions + branching dialogue trees.  Content is PLACEHOLDER WRITING - replace with your lore.
+--
+-- Node:   { Text = "...", Choices = { Choice, ... } }
+-- Choice: { Text = "...", Next = "nodeId" }              -> go to another node
+--         { Text = "...", Action = { Type = ..., ... } } -> do something on the SERVER, then close
+-- Action types handled by NPCService:
+--   { Type = "OpenShop", ShopId = "..." }
+--   { Type = "OfferMission", MissionId = "..." }   (ASSUMPTION: ids must exist in your MissionData)
+--   { Type = "CompleteMission", MissionId = "..." } (turn-in; server re-checks objectives are done)
+--   { Type = "Heal" }
+--   { Type = "Close" }
+--
+-- CONDITIONS (checked on the server every time a node is shown AND when a choice is picked):
+--   Choice.Requires = { MissionNotStarted = id } | { MissionActive = id } | { MissionReady = id } | { MissionCompleted = id }
+--     -> choice is hidden unless the condition is true
+--   Node.Redirect = { { Requires = {...}, To = "otherNode" }, ... }
+--     -> first matching redirect replaces this node (use on "greet" to give NPCs different openers)
+--
+-- NPC placement: NPCService looks for Parts tagged "NPCSpawn" with attribute NpcId = "<key below>".
+-- If MapBuilder doesn't create those, NPCs fall back to a ring around the first SpawnLocation.
+
+local DialogueData = {}
+
+DialogueData.NPCs = {
+	Archivist = {
+		Name = "The Archivist",
+		Title = "Mission Broker",
+		Color = Color3.fromRGB(120, 90, 160),
+		Start = "greet",
+		Nodes = {
+			greet = {
+				Redirect = {
+					{ Requires = { MissionReady = "M001" }, To = "turnin" },   -- ASSUMPTION: "M001" -> real MissionData id
+					{ Requires = { MissionActive = "M001" }, To = "inprogress" },
+				},
+				Text = "Another hexbound soul. The city is bleeding curses tonight. You want work, or answers?",
+				Choices = {
+					{ Text = "Give me work.", Next = "work", Requires = { MissionNotStarted = "M001" } },
+					{ Text = "Any more work?", Next = "nowork", Requires = { MissionCompleted = "M001" } },
+					{ Text = "What are curses?", Next = "lore" },
+					{ Text = "Nothing.", Action = { Type = "Close" } },
+				},
+			},
+			inprogress = {
+				Text = "The tunnels are still crawling. Come back when it's done.",
+				Choices = { { Text = "On it.", Action = { Type = "Close" } }, { Text = "What are curses again?", Next = "lore" } },
+			},
+			turnin = {
+				Text = "You reek of curse-ash. The tunnels are clear, then. Here - you earned this.",
+				Choices = { { Text = "[Turn in mission]", Action = { Type = "CompleteMission", MissionId = "M001" } } },
+			},
+			nowork = {
+				Text = "Not tonight. The city will offer up something worse soon enough.",
+				Choices = { { Text = "Back.", Next = "greet" } },
+			},
+			work = {
+				Text = "Something's nesting in the old transit tunnels. Clear it and I'll make it worth your while.",
+				Choices = {
+					{ Text = "I'll handle it.", Action = { Type = "OfferMission", MissionId = "M001" } }, -- ASSUMPTION: rename to a real MissionData id
+					{ Text = "Not yet.", Next = "greet" },
+				},
+			},
+			lore = {
+				Text = "Fear, hate, regret... it pools in places. Pool enough and it wakes up hungry. Your Lineage lets you bite back.",
+				Choices = { { Text = "Back.", Next = "greet" } },
+			},
+		},
+	},
+
+	Fence = {
+		Name = "Rook",
+		Title = "Fence",
+		Color = Color3.fromRGB(160, 120, 60),
+		Start = "greet",
+		Nodes = {
+			greet = {
+				Text = "Cash only. No questions, no refunds.",
+				Choices = {
+					{ Text = "Show me what you've got.", Action = { Type = "OpenShop", ShopId = "Fence" } },
+					{ Text = "Later.", Action = { Type = "Close" } },
+				},
+			},
+		},
+	},
+
+	Medic = {
+		Name = "Sister Vell",
+		Title = "Field Medic",
+		Color = Color3.fromRGB(200, 200, 220),
+		Start = "greet",
+		Nodes = {
+			greet = {
+				Text = "You look like a curse chewed on you. Hold still.",
+				Choices = {
+					{ Text = "Patch me up.", Action = { Type = "Heal" } },
+					{ Text = "Anything for sale?", Action = { Type = "OpenShop", ShopId = "Apothecary" } },
+					{ Text = "I'm fine.", Action = { Type = "Close" } },
+				},
+			},
+		},
+	},
+}
+
+return DialogueData
