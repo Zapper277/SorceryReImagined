@@ -1,0 +1,49 @@
+--!nonstrict
+--[[
+	ServerBootstrap  (ServerScriptService/ServerBootstrap, Script)
+	Starts the server services in dependency order. Modules without Init (CurseAI, MapBuilder) are only
+	required, which loads them.
+]]
+
+local ServerScriptService = game:GetService("ServerScriptService")
+local Services = ServerScriptService:WaitForChild("Services")
+
+local ORDER = {
+	"PlayerDataService",  -- profiles must exist before anything reads them
+	"CombatService",      -- creates the Remotes folder and registers characters
+	"HexService",
+	"TechniqueRegistry",
+	"ProgressionService", -- applies Lineage, stats and gear on spawn (needs Hex and Techniques)
+	"InventoryService",
+	"RollService",
+	"TradeService",       -- registers a Roll block check
+	"CurseAI",
+	"MapBuilder",
+	"MissionService",     -- builds the hub and registers Roll/Trade block checks
+	"DomainService",
+}
+
+for _, name in ipairs(ORDER) do
+	local module = require(Services:WaitForChild(name))
+	if type(module.Init) == "function" then
+		local ok, err = pcall(module.Init, module)
+		if not ok then warn(("[Bootstrap] %s:Init failed: %s"):format(name, tostring(err))) end
+	end
+end
+
+-- Test dummies: any model in workspace.Dummies with a Humanoid is registered as a combat target
+local CombatService = require(Services.CombatService)
+local dummies = workspace:FindFirstChild("Dummies")
+if dummies then
+	for _, m in ipairs(dummies:GetChildren()) do
+		if m:IsA("Model") then CombatService:RegisterEntity(m) end
+	end
+	dummies.ChildAdded:Connect(function(m)
+		if m:IsA("Model") then
+			m:WaitForChild("HumanoidRootPart", 5)
+			CombatService:RegisterEntity(m)
+		end
+	end)
+end
+
+print("[HEXBOUND] Server ready")
