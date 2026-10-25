@@ -1,0 +1,133 @@
+-- DomainController (LocalScript, StarterPlayerScripts)
+-- Client-side presentation for Domains: dome visual, color grading, camera shake, title card.
+-- PURELY COSMETIC - all Domain logic stays in your DomainService.
+--
+-- Two ways it triggers (works with either, no double-play):
+--  1) DomainService calls ClientBridgeService.BroadcastDomain(caster, center, radius, duration, lineageId, color)
+--  2) AUTO-DETECT (no DomainService edit needed): any BasePart/Model in workspace with attribute
+--     "HexDomain" = true. Optional attributes: "Radius", "Duration", "LineageId", "CasterUserId", "Color" (Color3).
+-- ASSUMPTION: if your DomainService already builds its own dome part, set the HexDomain attribute on it.
+-- NEEDS ART: dome material/texture, cast animation, per-lineage title art, real camera choreography.
+
+local Players = game:GetService("Players")
+local Lighting = game:GetService("Lighting")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Remotes = require(ReplicatedStorage:WaitForChild("Remotes"))
+local UIKit = require(ReplicatedStorage:WaitForChild("UIKit"))
+
+local LP = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+
+local LineageData
+pcall(function() LineageData = require(ReplicatedStorage:WaitForChild("LineageData", 5)) end)
+
+local function domainName(lineageId)
+	if not LineageData or not lineageId then return "DOMAIN EXPANSION" end
+	local def = (LineageData.Lineages and LineageData.Lineages[lineageId]) or LineageData[lineageId]
+	if type(def) ~= "table" then return "DOMAIN EXPANSION" end
+	local d = def.Domain
+	return (type(d) == "table" and (d.Name or d.DisplayName)) or def.DomainName or ("DOMAIN: " .. (def.Name or tostring(lineageId))):upper()
+end
+
+local gui = UIKit.Screen("DomainUI", 40)
+local active = {} -- [key] = true (prevents double-play from remote + auto-detect)
+
+local function shake(duration, intensity)
+	if LP:GetAttribute("Setting_CameraShake") == false then return end
+	local t0 = os.clock()
+	local conn
+	conn = RunService.RenderStepped:Connect(function()
+		local e = os.clock() - t0
+		if e > duration then conn:Disconnect() return end
+		local k = intensity * (1 - e / duration)
+		camera.CFrame = camera.CFrame * CFrame.Angles(math.rad((math.random() - 0.5) * k), math.rad((math.random() - 0.5) * k), 0)
+	end)
+end
+
+local function titleCard(text, color)
+	local lbl = UIKit.Label(gui, text, UDim2.new(1, 0, 0, 80), UDim2.new(0, 0, 0.32, 0), {
+		Font = UIKit.Theme.FontBold, TextSize = 52, TextXAlignment = Enum.TextXAlignment.Center,
+		TextColor3 = color, TextTransparency = 1, TextStrokeTransparency = 1, TextStrokeColor3 = Color3.new(0, 0, 0),
+	})
+	TweenService:Create(lbl, TweenInfo.new(0.25), { TextTransparency = 0, TextStrokeTransparency = 0.3 }):Play()
+	task.delay(2.2, function()
+		local tw = TweenService:Create(lbl, TweenInfo.new(0.6), { TextTransparency = 1, TextStrokeTransparency = 1 })
+		tw:Play(); tw.Completed:Wait(); lbl:Destroy()
+	end)
+end
+
+local function play(info)
+	local key = info.Key or tostring(info.Center)
+	if active[key] then return end
+	active[key] = true
+
+	local color = info.Color or Color3.fromRGB(90, 20, 160)
+	local radius = info.Radius or 40
+	local duration = info.Duration or 10
+
+	-- Dome (local only, non-collidable)
+	local dome = Instance.new("Part")
+	dome.Name = "DomainDomeFX"
+	dome.Shape = Enum.PartType.Ball
+	dome.Anchored, dome.CanCollide, dome.CanQuery, dome.CanTouch, dome.CastShadow = true, false, false, false, false
+	dome.Material = Enum.Material.ForceField
+	dome.Color = color
+	dome.Size = Vector3.one
+	dome.Transparency = 0.2
+	dome.CFrame = CFrame.new(info.Center)
+	dome.Parent = workspace
+	TweenService:Create(dome, TweenInfo.new(0.8, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), { Size = Vector3.one * radius * 2 }):Play()
+
+	-- Only grade/shake if *this* player is inside the domain
+	local root = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+	local inside = root and (root.Position - info.Center).Magnitude <= radius + 5
+	local cc
+	if inside then
+		cc = Instance.new("ColorCorrectionEffect")
+		cc.Name = "DomainCC"
+		cc.Parent = Lighting
+		TweenService:Create(cc, TweenInfo.new(0.6), { Saturation = -0.6, Contrast = 0.25, TintColor = color:Lerp(Color3.new(1, 1, 1), 0.6) }):Play()
+		shake(0.6, 2.5)
+	end
+
+	local isMine = info.Caster == LP
+	titleCard(domainName(info.LineageId), isMine and UIKit.RarityColors.Legendary or color:Lerp(Color3.new(1, 1, 1), 0.3))
+
+	task.delay(duration, function()
+		local tw = TweenService:Create(dome, TweenInfo.new(0.6), { Transparency = 1, Size = dome.Size * 1.1 })
+		tw:Play()
+		if cc then TweenService:Create(cc, TweenInfo.new(0.6), { Saturation = 0, Contrast = 0, TintColor = Color3.new(1, 1, 1) }):Play() end
+		tw.Completed:Wait()
+		dome:Destroy()
+		if cc then cc:Destroy() end
+		active[key] = nil
+	end)
+end
+
+-- 1) Remote trigger
+Remotes.Event("DomainCast").OnClientEvent:Connect(function(info)
+	if type(info) == "table" and typeof(info.Center) == "Vector3" then
+		info.Key = (info.Caster and info.Caster.UserId or 0) .. ":" .. math.floor(info.Center.X) .. ":" .. math.floor(info.Center.Z)
+		play(info)
+	end
+end)
+
+-- 2) Attribute auto-detect
+local function check(inst)
+	if inst:GetAttribute("HexDomain") ~= true then return end
+	local pos = inst:IsA("BasePart") and inst.Position or (inst:IsA("Model") and inst:GetPivot().Position)
+	if not pos then return end
+	local casterId = inst:GetAttribute("CasterUserId")
+	play({
+		Key = (casterId or 0) .. ":" .. math.floor(pos.X) .. ":" .. math.floor(pos.Z),
+		Center = pos,
+		Radius = inst:GetAttribute("Radius") or (inst:IsA("BasePart") and inst.Size.X / 2) or 40,
+		Duration = inst:GetAttribute("Duration") or 10,
+		LineageId = inst:GetAttribute("LineageId"),
+		Color = inst:GetAttribute("Color"),
+		Caster = casterId and Players:GetPlayerByUserId(casterId) or nil,
+	})
+end
+workspace.DescendantAdded:Connect(function(d) task.defer(check, d) end)
