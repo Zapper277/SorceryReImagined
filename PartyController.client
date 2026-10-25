@@ -1,0 +1,113 @@
+-- PartyController (LocalScript, StarterPlayerScripts)  -- key: P
+-- UI for PartyService: invite nearby players, see members (with HP), leave/kick/promote.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Remotes = require(ReplicatedStorage:WaitForChild("Remotes"))
+local UIKit = require(ReplicatedStorage:WaitForChild("UIKit"))
+local T = UIKit.Theme
+local LP = Players.LocalPlayer
+
+local TOGGLE_KEY = Enum.KeyCode.P -- ASSUMPTION: not used by CombatController
+local INVITE_RANGE = 60
+
+local gui = UIKit.Screen("PartyUI", 14)
+local panel, body = UIKit.Panel(gui, "Party", UDim2.fromOffset(300, 360))
+panel.Visible = false
+
+UIKit.Label(body, "MEMBERS", UDim2.new(1, 0, 0, 16), nil, { TextColor3 = T.SubText, TextSize = 12 })
+local memberList = UIKit.Scroll(body, UDim2.new(1, 0, 0.45, -16), UDim2.fromOffset(0, 18))
+UIKit.Label(body, "INVITE NEARBY", UDim2.new(1, 0, 0, 16), UDim2.new(0, 0, 0.45, 6), { TextColor3 = T.SubText, TextSize = 12 })
+local inviteList = UIKit.Scroll(body, UDim2.new(1, 0, 0.55, -64), UDim2.new(0, 0, 0.45, 24))
+local leaveBtn = UIKit.Button(body, "Leave Party", UDim2.new(1, 0, 0, 30), UDim2.new(0, 0, 1, -30))
+leaveBtn.BackgroundColor3 = T.Bad
+leaveBtn.MouseButton1Click:Connect(function() Remotes.Event("PartyAction"):FireServer("Leave") end)
+
+-- Compact party frame on HUD (left side, under where HP usually is)
+local hudFrame = Instance.new("Frame")
+hudFrame.Size = UDim2.fromOffset(180, 0)
+hudFrame.AutomaticSize = Enum.AutomaticSize.Y
+hudFrame.Position = UDim2.new(0, 16, 0.35, 0)
+hudFrame.BackgroundTransparency = 1
+hudFrame.Parent = gui
+local hl = Instance.new("UIListLayout"); hl.Padding = UDim.new(0, 4); hl.Parent = hudFrame
+
+local party = nil
+local hpBars = {}
+
+local function renderHud()
+	UIKit.Clear(hudFrame); table.clear(hpBars)
+	if not party then return end
+	for _, m in party.Members do
+		if m ~= LP then
+			local f = Instance.new("Frame")
+			f.Size = UDim2.new(1, 0, 0, 30); f.BackgroundColor3 = T.Bg; f.BackgroundTransparency = 0.3; f.BorderSizePixel = 0; f.Parent = hudFrame
+			Instance.new("UICorner", f).CornerRadius = UDim.new(0, 4)
+			UIKit.Label(f, (party.Leader == m and "★ " or "") .. m.DisplayName, UDim2.new(1, -8, 0, 16), UDim2.fromOffset(6, 1), { TextSize = 12 })
+			local bg = Instance.new("Frame"); bg.Size = UDim2.new(1, -12, 0, 6); bg.Position = UDim2.fromOffset(6, 20); bg.BackgroundColor3 = T.Panel; bg.BorderSizePixel = 0; bg.Parent = f
+			local fill = Instance.new("Frame"); fill.Size = UDim2.fromScale(1, 1); fill.BackgroundColor3 = T.Good; fill.BorderSizePixel = 0; fill.Parent = bg
+			hpBars[m] = fill
+		end
+	end
+end
+
+local function renderPanel()
+	UIKit.Clear(memberList)
+	leaveBtn.Visible = party ~= nil
+	if not party then
+		UIKit.Label(memberList, "Not in a party.", UDim2.new(1, 0, 0, 24), nil, { TextColor3 = T.SubText })
+	else
+		local amLeader = party.Leader == LP
+		for _, m in party.Members do
+			local row = Instance.new("Frame"); row.Size = UDim2.new(1, 0, 0, 28); row.BackgroundTransparency = 1; row.Parent = memberList
+			UIKit.Label(row, (party.Leader == m and "★ " or "") .. m.DisplayName, UDim2.new(1, -120, 1, 0))
+			if amLeader and m ~= LP then
+				local k = UIKit.Button(row, "Kick", UDim2.fromOffset(54, 24), UDim2.new(1, -112, 0, 2)); k.BackgroundColor3 = T.Bad
+				k.MouseButton1Click:Connect(function() Remotes.Event("PartyAction"):FireServer("Kick", m) end)
+				local pr = UIKit.Button(row, "Lead", UDim2.fromOffset(54, 24), UDim2.new(1, -54, 0, 2))
+				pr.MouseButton1Click:Connect(function() Remotes.Event("PartyAction"):FireServer("Promote", m) end)
+			end
+		end
+	end
+	UIKit.Clear(inviteList)
+	local myRoot = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+	for _, p in Players:GetPlayers() do
+		local r = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+		local inMine = party and table.find(party.Members, p)
+		if p ~= LP and not inMine and myRoot and r and (r.Position - myRoot.Position).Magnitude <= INVITE_RANGE then
+			local b = UIKit.Button(inviteList, "Invite " .. p.DisplayName, UDim2.new(1, 0, 0, 28))
+			b.MouseButton1Click:Connect(function() Remotes.Event("PartyAction"):FireServer("Invite", p) end)
+		end
+	end
+end
+
+Remotes.Event("PartySync").OnClientEvent:Connect(function(p)
+	party = p
+	renderHud()
+	if panel.Visible then renderPanel() end
+end)
+
+Remotes.Event("PartyInvite").OnClientEvent:Connect(function(from)
+	local pop, pb = UIKit.Panel(gui, "Party Invite", UDim2.fromOffset(300, 130), UDim2.new(0.5, 0, 0.25, 0))
+	UIKit.Label(pb, from.DisplayName .. " invited you to a party.", UDim2.new(1, 0, 0, 30), nil, { TextXAlignment = Enum.TextXAlignment.Center })
+	local yes = UIKit.Button(pb, "Join", UDim2.new(0.5, -4, 0, 30), UDim2.new(0, 0, 0, 44)); yes.BackgroundColor3 = T.Good
+	local no = UIKit.Button(pb, "Decline", UDim2.new(0.5, -4, 0, 30), UDim2.new(0.5, 4, 0, 44)); no.BackgroundColor3 = T.Bad
+	yes.MouseButton1Click:Connect(function() Remotes.Event("PartyAction"):FireServer("Accept", from); pop:Destroy() end)
+	no.MouseButton1Click:Connect(function() Remotes.Event("PartyAction"):FireServer("Decline", from); pop:Destroy() end)
+	task.delay(30, function() if pop.Parent then pop:Destroy() end end)
+end)
+
+-- Live HP bars (reads replicated Humanoid health - display only)
+local acc = 0
+RunService.Heartbeat:Connect(function(dt)
+	acc += dt; if acc < 0.2 then return end; acc = 0
+	for m, fill in hpBars do
+		local h = m.Character and m.Character:FindFirstChildOfClass("Humanoid")
+		local pct = h and h.MaxHealth > 0 and math.clamp(h.Health / h.MaxHealth, 0, 1) or 0
+		fill.Size = UDim2.fromScale(pct, 1)
+		fill.BackgroundColor3 = pct > 0.5 and T.Good or pct > 0.2 and UIKit.RarityColors.Legendary or T.Bad
+	end
+end)
+
+UIKit.BindToggle(TOGGLE_KEY, panel, renderPanel)
