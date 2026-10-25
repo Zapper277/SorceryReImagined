@@ -1,0 +1,23 @@
+-- VFXData (ModuleScript, ReplicatedStorage)
+-- Greybox VFX definitions played by EffectsController. These are neon-part placeholders.
+-- NEEDS ART: replace with ParticleEmitters/Beams; keep the same keys so server calls don't change.
+--
+-- Shape: "Sphere" | "Ring" | "Burst" | "Beam"
+-- Grow: end size multiplier over Duration. Fade: transparency tweens to 1.
+
+local VFXData = {
+	HitSpark      = { Shape = "Burst",  Color = Color3.fromRGB(255, 230, 180), Size = 1.5, Grow = 2.0, Duration = 0.15 },
+	HeavyHit      = { Shape = "Burst",  Color = Color3.fromRGB(255, 140, 60),  Size = 3,   Grow = 2.5, Duration = 0.25 },
+	BlockSpark    = { Shape = "Ring",   Color = Color3.fromRGB(180, 200, 255), Size = 3,   Grow = 1.6, Duration = 0.2 },
+	ParryFlash    = { Shape = "Ring",   Color = Color3.fromRGB(255, 255, 255), Size = 4,   Grow = 3.0, Duration = 0.3 },
+	GuardBreak    = { Shape = "Burst",  Color = Color3.fromRGB(255, 60, 60),   Size = 4,   Grow = 2.0, Duration = 0.4 },
+	HexCast       = { Shape = "Ring",   Color = Color3.fromRGB(140, 60, 255),  Size = 5,   Grow = 1.8, Duration = 0.35 },
+	HexProjectile = { Shape = "Sphere", Color = Color3.fromRGB(160, 80, 255),  Size = 1.5, Grow = 1.0, Duration = 0.1 },
+	HexExplosion  = { Shape = "Sphere", Color = Color3.fromRGB(170, 70, 255),  Size = 4,   Grow = 3.0, Duration = 0.4 },
+	CurseSpawn    = { Shape = "Ring",   Color = Color3.fromRGB(40, 0, 20),     Size = 6,   Grow = 2.0, Duration = 0.8 },
+	CurseDeath    = { Shape = "Burst",  Color = Color3.fromRGB(90, 0, 40),     Size = 5,   Grow = 2.5, Duration = 0.6 },
+	LevelUp       = { Shape = "Ring",   Color = Color3.fromRGB(255, 215, 80),  Size = 6,   Grow = 2.0, Duration = 0.8 },
+	DomainPulse   = { Shape = "Sphere", Color = Color3.fromRGB(20, 0, 40),     Size = 10,  Grow = 1.2, Duration = 0.5 },
+}
+
+return VFXData
