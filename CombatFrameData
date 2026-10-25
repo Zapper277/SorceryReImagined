@@ -1,0 +1,71 @@
+--!nonstrict
+--[[
+	CombatFrameData  (ReplicatedStorage/Shared/CombatFrameData)
+	HEXBOUND - the frame data CombatService reads. Everything here is counted in
+	frames at 60 FPS. Change balance numbers here, not in the service code.
+
+	Combo rule for M1 hits 1-3: target hitstun must be greater than
+	(remaining active frames + recovery + next hit's startup). The "Adv" comments
+	show the frame advantage on hit. A positive number means the chain is a true combo.
+]]
+
+local FrameData = {}
+
+FrameData.FPS = 60
+
+-- Hitbox: a box placed `offset` studs in front of the attacker's HumanoidRootPart.
+local STANDARD_BOX = { size = Vector3.new(5, 5, 5), offset = 3.5 }
+local FINISHER_BOX = { size = Vector3.new(6, 5, 6), offset = 4 }
+
+FrameData.M1 = {
+	-- 2 + 10 + 6 = 18 vs hitstun 22  -> Adv +4
+	{ name = "Strike1", startup = 6, active = 3, recovery = 10, damage = 4,
+	  hitstun = 22, blockstun = 10, guardDamage = 10, hitbox = STANDARD_BOX },
+	-- 2 + 10 + 7 = 19 vs hitstun 22  -> Adv +3
+	{ name = "Strike2", startup = 6, active = 3, recovery = 10, damage = 4,
+	  hitstun = 22, blockstun = 10, guardDamage = 10, hitbox = STANDARD_BOX },
+	-- 2 + 12 + 9 = 23 vs hitstun 26  -> Adv +3
+	{ name = "Strike3", startup = 7, active = 3, recovery = 12, damage = 5,
+	  hitstun = 26, blockstun = 12, guardDamage = 12, hitbox = STANDARD_BOX },
+	-- Finisher: launches the target and ends the chain. It is unsafe if blocked (-6) and punishable if parried.
+	{ name = "Finisher", startup = 9, active = 4, recovery = 22, damage = 7,
+	  hitstun = 34, blockstun = 16, guardDamage = 30, hitbox = FINISHER_BOX,
+	  knockback = { horizontal = 55, vertical = 22, duration = 0.18 } },
+}
+
+FrameData.Chain = {
+	bufferWindow = 8,       -- an M1 pressed in the last N frames of recovery is queued
+	resetWindow = 30,       -- frames after recovery ends during which the chain continues
+	finisherCooldown = 36,  -- lockout after the finisher before a new chain can start
+}
+
+FrameData.Block = {
+	parryWindow = 8,        -- the first N frames after raising block count as a parry
+	parryLockout = 30,      -- after a block with no parry, the next raise has no parry window for N frames (stops parry spam)
+	releaseRecovery = 6,    -- frames after dropping block before you can attack
+	maxGuard = 100,
+	guardRegenPerSecond = 25,
+	guardRegenDelay = 60,   -- frames after the last guard hit before guard starts regenerating
+	guardBreakStun = 75,
+	frontDot = 0.0,         -- block only works if the attacker is within the front 180° of the defender
+	walkSpeedMultiplier = 0.45,
+}
+
+FrameData.Parry = {
+	attackerStun = 40,      -- the attacker is stunned this long; the defender acts right away
+}
+
+FrameData.Movement = {
+	attackWalkSpeedMultiplier = 0.35,
+	stunWalkSpeed = 0,
+}
+
+FrameData.Network = {
+	minRequestInterval = 0.05, -- server-side rate limit for each player, in seconds
+}
+
+function FrameData.toSeconds(frames: number): number
+	return frames / FrameData.FPS
+end
+
+return FrameData
